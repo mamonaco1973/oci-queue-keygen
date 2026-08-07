@@ -1,0 +1,125 @@
+<!-- =============================================================================
+ index.html
+ Simple client for AWS Keygen API
+============================================================================= -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Key Generator</title>
+<style>
+body { font-family: sans-serif; max-width: 700px; margin: 2em auto; }
+label { display: block; margin-top: 1em; }
+button { margin-top: 1em; padding: 0.5em 1em; }
+textarea {
+  width: 100%;
+  font-family: monospace;
+  white-space: pre-wrap;
+  word-break: break-all;
+  background: #f5f5f5;
+  padding: 1em;
+  box-sizing: border-box;
+}
+#status { margin-top: 1em; font-weight: bold; }
+.copy-btn {
+  margin-top: 0.5em;
+  padding: 0.4em 0.8em;
+  font-size: 0.9em;
+}
+</style>
+</head>
+<body>
+<h2>Generate SSH Keypair</h2>
+
+<label>
+  Select key type:
+  <select id="keyType">
+    <option value="rsa-2048">RSA 2048-bit</option>
+    <option value="rsa-4096">RSA 4096-bit</option>
+    <option value="ed25519">Ed25519</option>
+  </select>
+</label>
+
+<button id="generateBtn">Generate Keypair</button>
+
+<div id="status"></div>
+
+<!-- -----------------------------------------------------------------------------
+ Public Key Section
+----------------------------------------------------------------------------- -->
+<h3>Public Key</h3>
+<textarea id="pubKey" rows="3" readonly></textarea>
+<button class="copy-btn"
+  onclick="navigator.clipboard.writeText(document.getElementById('pubKey').value)">
+  Copy Public Key
+</button>
+
+<!-- -----------------------------------------------------------------------------
+ Private Key Section
+----------------------------------------------------------------------------- -->
+<h3>Private Key</h3>
+<textarea id="privKey" rows="15" readonly></textarea>
+<button class="copy-btn"
+  onclick="navigator.clipboard.writeText(document.getElementById('privKey').value)">
+  Copy Private Key
+</button>
+
+<script>
+// -----------------------------------------------------------------------------
+// Utility: sleep
+// -----------------------------------------------------------------------------
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// -----------------------------------------------------------------------------
+// Generate Keypair handler
+// -----------------------------------------------------------------------------
+document.getElementById("generateBtn").onclick = async () => {
+  const sel = document.getElementById("keyType").value;
+  const [type, bits] = sel.split("-");
+  document.getElementById("status").textContent = "Requesting keypair...";
+
+  try {
+    // -----------------------------------------------------------
+    // Step 1: POST /keygen
+    // -----------------------------------------------------------
+    const resp = await fetch(`${API_BASE}/keygen`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ key_type: type, key_bits: Number(bits) })
+    });
+    const data = await resp.json();
+    const id = data.request_id;
+    document.getElementById("status").textContent =
+      `Request ID: ${id} (waiting...)`;
+
+    // -----------------------------------------------------------
+    // Step 2: Poll /result/{id}
+    // -----------------------------------------------------------
+    let ready = false, result;
+    for (let i = 0; i < 20; i++) {
+      await sleep(1500);
+      const res = await fetch(`${API_BASE}/result/${id}`);
+      result = await res.json();
+      if (result.status !== "pending") { ready = true; break; }
+    }
+
+    // -----------------------------------------------------------
+    // Step 3: Display results
+    // -----------------------------------------------------------
+    if (ready) {
+      document.getElementById("status").textContent = "Keypair ready!";
+      document.getElementById("pubKey").value = atob(result.public_key_b64);
+      document.getElementById("privKey").value = atob(result.private_key_b64);
+    } else {
+      document.getElementById("status").textContent =
+        "Timed out waiting for result.";
+    }
+  } catch (err) {
+    document.getElementById("status").textContent =
+      "Error: " + err.message;
+  }
+};
+</script>
+</body>
+</html>
