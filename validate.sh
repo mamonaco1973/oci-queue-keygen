@@ -11,9 +11,10 @@
 #   - curl, jq, terraform, OCI CLI (authenticated); deployment completed.
 #
 # Note on timing:
-#   The async path is API GW → Streaming → Service Connector Hub → worker.
-#   The connector's batch window (~60s) plus a possible cold start means the
-#   first result can take a couple of minutes — the poll loop is patient.
+#   The async path is API GW → post fn → Queue → VM consumer (long-poll) → NoSQL.
+#   Steady-state latency is near-instant, but on the FIRST deploy the worker's
+#   cloud-init needs a minute or two to install deps and start the daemon, so
+#   the poll loop is patient.
 # ==============================================================================
 
 set -euo pipefail
@@ -26,8 +27,8 @@ api_url="$(terraform output -raw api_gateway_endpoint)"
 cd ..
 
 website_url="N/A"
-if [ -d 04-webapp ]; then
-  cd 04-webapp
+if [ -d 05-webapp ]; then
+  cd 05-webapp
   website_url="$(terraform output -raw website_url 2>/dev/null || echo "N/A")"
   cd ..
 fi

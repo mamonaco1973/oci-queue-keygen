@@ -131,6 +131,17 @@
     }
 
     $("go").addEventListener("click", generate);
+
+    // Cold-start keep-alive: ping /heartbeat once a minute so the result
+    // (polling) function stays warm between generations.  Best-effort — a
+    // failed ping is ignored.  Mirrors the notes app's background probe.
+    const HEARTBEAT_MS = 60000;
+    async function heartbeat() {
+      try { await fetch(`${API_BASE}/heartbeat`, { cache: "no-store" }); }
+      catch (e) { /* silent */ }
+    }
+    heartbeat();
+    setInterval(heartbeat, HEARTBEAT_MS);
   </script>
 </body>
 </html>

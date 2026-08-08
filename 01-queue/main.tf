@@ -1,11 +1,12 @@
 # ==============================================================================
-# Phase 1: Stream + OCIR — message bus and container registry
+# Phase 1: Queue + OCIR — message bus and container registry
 # ==============================================================================
 # Creates the two prerequisites the rest of the deployment depends on:
-#   - an OCI Streaming stream (the async message bus; SQS analog)
+#   - an OCI Queue (the async message bus; SQS analog)
 #   - a private OCIR repository to hold the keygen functions image
-# Must run before 02-docker (image push) and 03-functions (which read the
-# stream OCID + endpoint via TF_VAR set by apply.sh).
+# Must run before 02-docker (image push), 03-functions (post fn publishes to the
+# queue), and 04-worker (a VM consumer drains the queue). apply.sh passes the
+# queue OCID + endpoint to those phases via TF_VAR.
 # ==============================================================================
 
 terraform {

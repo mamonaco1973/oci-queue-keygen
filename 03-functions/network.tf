@@ -2,7 +2,7 @@
 # Networking
 # ==============================================================================
 # Minimal VCN with a single public subnet used by both OCI Functions (for
-# outbound connectivity to OCIR, NoSQL, and Streaming) and the API Gateway
+# outbound connectivity to OCIR, NoSQL, and the Queue) and the API Gateway
 # (for inbound HTTPS).  An Internet Gateway keeps the topology simple for a demo.
 # ==============================================================================
 
@@ -49,7 +49,7 @@ resource "oci_core_security_list" "public" {
   vcn_id         = oci_core_vcn.keygen.id
   display_name   = "keygen-public-sl"
 
-  # Allow all egress — Functions reach OCIR (image pull), NoSQL, and Streaming.
+  # Allow all egress — Functions reach OCIR (image pull), NoSQL, and the Queue.
   egress_security_rules {
     protocol    = "all"
     destination = "0.0.0.0/0"

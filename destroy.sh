@@ -5,9 +5,10 @@
 # Purpose:
 #   Tears down the KeyGen stack deployed by apply.sh, in reverse phase order:
 #
-#   Phase 4 (04-webapp):    Destroy Object Storage bucket and objects
-#   Phase 3 (03-functions): Destroy Functions, NoSQL, VCN, IAM, API GW, Connector
-#   Phase 1 (01-stream):    Destroy Streaming stream + OCIR repo (images purged first)
+#   Phase 5 (05-webapp):    Destroy Object Storage bucket and objects
+#   Phase 4 (04-worker):    Destroy the worker VM, its VCN, and IAM
+#   Phase 3 (03-functions): Destroy Functions, NoSQL, VCN, IAM, API Gateway
+#   Phase 1 (01-queue):     Destroy Queue + OCIR repo (images purged first)
 #
 #   Phase 2 has no Terraform state — only the Docker image in OCIR, which is
 #   deleted during the OCIR purge step before Phase 1 destroy.
@@ -33,31 +34,47 @@ export TF_VAR_tenancy_ocid="$TENANCY_OCID"
 export TF_VAR_compartment_id="$OCI_COMPARTMENT_ID"
 export TF_VAR_region="$REGION"
 
-# 03-functions needs the stream vars declared even for destroy (values unused
-# for teardown, but the variables must resolve). Pull them from 01-stream state.
-if [ -d 01-stream ]; then
-  cd 01-stream
-  export TF_VAR_stream_id="$(terraform output -raw stream_id 2>/dev/null || echo "unused")"
-  export TF_VAR_stream_endpoint="$(terraform output -raw stream_endpoint 2>/dev/null || echo "unused")"
+# 03-functions and 04-worker declare queue/table variables that must resolve
+# even for destroy (the values are unused for teardown). Pull them from state.
+if [ -d 01-queue ]; then
+  cd 01-queue
+  export TF_VAR_queue_id="$(terraform output -raw queue_id 2>/dev/null || echo unused)"
+  export TF_VAR_queue_endpoint="$(terraform output -raw queue_endpoint 2>/dev/null || echo unused)"
+  cd ..
+fi
+if [ -d 03-functions ]; then
+  cd 03-functions
+  export TF_VAR_nosql_table_name="$(terraform output -raw nosql_table_name 2>/dev/null || echo keygen_results)"
   cd ..
 fi
 
 # ------------------------------------------------------------------------------
-# Phase 4: Destroy static web application
+# Phase 5: Destroy static web application
 # ------------------------------------------------------------------------------
 
-echo "NOTE: [Phase 4/4] Destroying web application..."
+echo "NOTE: [Phase 5/5] Destroying web application..."
 
-cd 04-webapp || { echo "ERROR: 04-webapp directory missing."; exit 1; }
+cd 05-webapp || { echo "ERROR: 05-webapp directory missing."; exit 1; }
 terraform init
 terraform destroy -auto-approve
 cd ..
 
 # ------------------------------------------------------------------------------
-# Phase 3: Destroy Functions, NoSQL, API Gateway, Connector
+# Phase 4: Destroy the worker VM
 # ------------------------------------------------------------------------------
 
-echo "NOTE: [Phase 3/4] Destroying Functions, NoSQL, API Gateway, Connector..."
+echo "NOTE: [Phase 4/5] Destroying worker VM..."
+
+cd 04-worker || { echo "ERROR: 04-worker directory missing."; exit 1; }
+terraform init
+terraform destroy -auto-approve || terraform destroy -auto-approve
+cd ..
+
+# ------------------------------------------------------------------------------
+# Phase 3: Destroy Functions, NoSQL, API Gateway
+# ------------------------------------------------------------------------------
+
+echo "NOTE: [Phase 3/5] Destroying Functions, NoSQL, API Gateway..."
 
 cd 03-functions || { echo "ERROR: 03-functions directory missing."; exit 1; }
 terraform init
@@ -93,12 +110,12 @@ else
 fi
 
 # ------------------------------------------------------------------------------
-# Phase 1: Destroy Streaming stream and OCIR repository
+# Phase 1: Destroy Queue and OCIR repository
 # ------------------------------------------------------------------------------
 
-echo "NOTE: [Phase 1/4] Destroying Streaming stream and OCIR repository..."
+echo "NOTE: [Phase 1/5] Destroying Queue and OCIR repository..."
 
-cd 01-stream || { echo "ERROR: 01-stream directory missing."; exit 1; }
+cd 01-queue || { echo "ERROR: 01-queue directory missing."; exit 1; }
 terraform init
 terraform destroy -auto-approve
 cd ..

@@ -1,29 +1,32 @@
 # CLAUDE.md — oci-queue-keygen
 
-An asynchronous SSH key generation microservice on OCI. This is the OCI port of
-`aws-sqs-keygen`. A client submits a keygen request through API Gateway; the
-request is published to OCI Streaming; a Service Connector Hub drains the stream
-and invokes a worker Function that generates the keypair and stores it in OCI
-NoSQL. The client polls a result endpoint until the keys are ready.
+An asynchronous SSH key generation microservice on OCI, the port of
+`aws-sqs-keygen`. A client submits a request through API Gateway; the post
+function puts it on **OCI Queue**; a long-polling **consumer daemon on a
+micro-VM** generates the keypair and stores it in **OCI NoSQL**; the client
+polls a result endpoint until the keys are ready.
 
-> **Naming note:** the message bus is OCI **Streaming**, not OCI Queue. OCI Queue
-> cannot be a Service Connector Hub source, and Service Connector is the only way
-> to auto-invoke a Function from a message bus (the analog of AWS's SQS→Lambda
-> event-source mapping). Streaming is the sole Service Connector source that can
-> target Functions, so it is used here. The repo folder is historical; a
-> `oci-streaming-keygen` name is more accurate.
+> **Design history:** the AWS original uses an SQS→Lambda event-source mapping
+> (instant trigger). OCI has no equivalent — Queue can't trigger anything, and
+> Service Connector Hub (the only thing that can invoke a Function) batches on a
+> 60s-minimum window (~30s latency, unusable). So the worker is a long-polling
+> VM consumer instead of a serverless function: `GetMessages` returns the
+> instant a message arrives, and on an always-free shape it's effectively $0.
+> An earlier Streaming+SCH iteration was abandoned for this reason. The repo may
+> still be named for "queue"/"streaming"; the current design is **Queue + VM**.
 
 ---
 
 ## What This Project Does
 
-| Method | Path | Function | Behavior |
-|--------|------|----------|----------|
-| POST | `/keygen` | keygen-post | Publish request to Streaming, return 202 + `request_id` |
-| GET | `/result/{id}` | keygen-get | Return the stored keypair, or 202 while pending |
-| — | (Service Connector) | keygen-worker | Generate keypair, write result to NoSQL |
+| Method | Path | Handler | Behavior |
+|--------|------|---------|----------|
+| POST | `/keygen` | keygen-post (Function) | Put request on Queue, return 202 + `request_id` |
+| GET | `/result/{id}` | keygen-get (Function) | Return the stored keypair, or 202 while pending |
+| GET | `/heartbeat` | keygen-get (Function) | Fast 200 keep-alive (no NoSQL lookup) |
+| — | (Queue consumer) | consumer.py (VM daemon) | Generate keypair, write result to NoSQL |
 
-Keys are returned base64-encoded and expire from NoSQL after 1 day (table TTL).
+Keys are base64-encoded and expire from NoSQL after 1 day (table TTL).
 
 ---
 
@@ -34,76 +37,72 @@ Browser / curl
      │
      ▼
 OCI API Gateway — keygen-gateway (PUBLIC)
-     ├── POST /keygen       → Function: keygen-post ──put──► OCI Streaming (keygen-requests)
+     ├── POST /keygen      → Function: keygen-post ──put──► OCI Queue (keygen-requests)
+     │                                                              │ long-poll
+     │                                                              ▼
+     │                                              Worker VM: keygen-worker
+     │                                              systemd: consumer.py
+     │                                              (instance principal auth)
      │                                                              │
-     │                                                   Service Connector Hub
-     │                                                   (keygen-stream-to-worker)
      │                                                              ▼
-     │                                                     Function: keygen-worker
-     │                                                              │ Resource Principal
-     │                                                              ▼
-     └── GET /result/{id}   → Function: keygen-get ◄──read──  OCI NoSQL (keygen_results)
-                                        ▲ injects X-Request-Id header
+     └── GET /result/{id}  → Function: keygen-get ◄──read──  OCI NoSQL (keygen_results)
+         GET /heartbeat    → Function: keygen-get (X-Heartbeat → fast 200)
 ```
 
-**One image, three functions:** all three OCI Functions share a single Docker
-image in OCIR. A `FUNCTION_TYPE` env var (set per-function in Terraform) routes
-the FDK `handler()` entry point to `post` / `get` / `worker` at runtime.
+**One image, two functions:** `keygen-post` and `keygen-get` share a single OCIR
+image; `FUNCTION_TYPE` routes the FDK `handler()`. The worker is NOT a function —
+it's `consumer.py` running under systemd on a micro-VM.
 
-**Async trigger:** OCI has no native "message → invoke Function" for the Queue
-service. Streaming + Service Connector Hub is the faithful analog to AWS's
-SQS→Lambda event-source mapping. Worst-case dispatch latency ≈ the connector's
-`batch_time_in_sec` (60s), so the first result can take a couple of minutes.
+**Async trigger:** none exists on OCI. The worker long-polls the Queue
+(`GetMessages` with a 30s wait), so latency is near-zero in steady state.
 
-**Path parameters:** API Gateway does not forward URL path params to function
-bodies. For `/result/{id}`, the deployment spec injects `${request.path[id]}` as
-the `X-Request-Id` header; the function reads `ctx.Headers().get("x-request-id")`.
+**Path parameters:** API Gateway injects `${request.path[id]}` as `X-Request-Id`
+for `/result/{id}`; the get function reads `ctx.Headers().get("x-request-id")`.
+The `/heartbeat` route injects `X-Heartbeat` so the get function returns early.
 
 ---
 
 ## Repository Layout
 
 ```
-01-stream/
+01-queue/
   main.tf        OCI provider, variables
-  stream.tf      Streaming stream pool + stream (the message bus)
+  queue.tf       OCI Queue (the message bus)
   registry.tf    OCIR repository (holds the functions image)
-  outputs.tf     stream_id, stream_endpoint, repository_name
+  outputs.tf     queue_id, queue_endpoint, repository_name
 02-docker/
   code/
-    func.py          post/get/worker handlers; dispatches via FUNCTION_TYPE
-    requirements.txt fdk + oci + cryptography
+    func.py          post + get handlers; dispatches via FUNCTION_TYPE
+    requirements.txt fdk + oci (no cryptography — keygen runs on the VM)
     Dockerfile       fnproject/python:3.11 multi-stage build
   build.sh           builds + pushes image; writes .build_output (IMAGE_PATH)
 03-functions/
-  main.tf        OCI provider, variables (image_path, stream_id, stream_endpoint)
+  main.tf        variables (image_path, queue_id, queue_endpoint)
   network.tf     VCN, public subnet, internet gateway, security list
   nosql.tf       keygen_results table (correlation_id PK, USING TTL 1 DAYS)
-  functions.tf   Functions Application + 3 Function resources
-  api.tf         API Gateway + deployment (POST /keygen, GET /result/{id})
-  connector.tf   Service Connector Hub (Streaming source → worker target)
-  iam.tf         Dynamic Group + policies (functions, API GW, Service Connector)
+  functions.tf   Functions Application + post/get Function resources
+  api.tf         API Gateway + deployment (POST /keygen, GET /result/{id}, /heartbeat)
+  iam.tf         Dynamic Group + policies (functions→NoSQL+Queue, API GW→functions)
   logging.tf     Functions Application invoke logs
   outputs.tf     api_gateway_endpoint, nosql_table_name, ocir_image_path
-04-webapp/
+04-worker/
+  main.tf            provider (oci/tls/local), variables
+  network.tf         self-contained VCN + public subnet (SSH + egress)
+  compute.tf         Ubuntu micro-VM + generated SSH key + cloud-init
+  cloud-init.yaml.tmpl installs deps, drops consumer.py + env, starts systemd
+  consumer.py        long-polling Queue consumer (instance principal auth)
+  iam.tf             Dynamic Group (by instance OCID) + Queue/NoSQL policy
+  outputs.tf         worker_public_ip, worker_ssh_command
+05-webapp/
   index.html.tmpl  Web UI — API_BASE injected at deploy time
   favicon.ico
   main.tf          OCI provider, variables
   storage.tf       Object Storage bucket (public) + object uploads
 check_env.sh   Pre-flight: verify tools + OCI CLI connection
-apply.sh       Full deployment (4 phases + validation)
+apply.sh       Full deployment (5 phases + validation)
 destroy.sh     Teardown in reverse order; purges OCIR images + auth token
 validate.sh    End-to-end smoke test via curl (POST then poll)
 ```
-
----
-
-## Prerequisites
-
-- `oci`, `terraform`, `docker`, `jq`, `envsubst` in PATH
-- OCI CLI configured (`~/.oci/config` with API key)
-- Docker daemon running (for local image build)
-- Max 2 auth tokens per user — `apply.sh` creates/caches one at `~/.oci/ocir_token`
 
 ---
 
@@ -115,28 +114,26 @@ validate.sh    End-to-end smoke test via curl (POST then poll)
 ./validate.sh   # smoke test only (after deploy)
 ```
 
-`apply.sh` runs four phases: 01-stream (OCIR + Streaming) → 02-docker (build +
-push) → 03-functions (Functions, NoSQL, API GW, Service Connector, IAM) →
-04-webapp (Object Storage site). Stream OCID + endpoint are captured from Phase 1
-output and passed to Phase 3 as `TF_VAR_stream_id` / `TF_VAR_stream_endpoint`.
+Phase hand-off (via `TF_VAR_*` in apply.sh): 01-queue exports `queue_id` +
+`queue_endpoint` → 03-functions (post) and 04-worker (consumer); 03-functions
+exports `nosql_table_name` → 04-worker.
 
 ---
 
-## Function Code
+## The Worker VM
 
-All handlers live in `02-docker/code/func.py`. A single `handler()` dispatches on
-`FUNCTION_TYPE`:
+`04-worker` runs `consumer.py` as the `keygen-worker` systemd service on a
+micro-VM (default `VM.Standard.E2.1.Micro`, always-free). Auth is **instance
+principals** — a dynamic group matches the instance OCID; the policy grants
+`use queues` (consume/delete) and `manage nosql-rows`. Debug:
 
-- **post** — reads `{key_type, key_bits}`, generates a UUID4 correlation id,
-  publishes a base64-encoded message to Streaming via `oci.streaming`, returns
-  202 with `request_id`.
-- **get** — reads the correlation id from `X-Request-Id`, `get_row` from NoSQL;
-  200 with the keypair or 202 while pending.
-- **worker** — invoked by Service Connector Hub with a batch of stream records;
-  base64-decodes each message value, generates the keypair (`cryptography`
-  RSA/ed25519), writes the result to NoSQL. Resource Principal auth throughout.
+```bash
+terraform -chdir=04-worker output -raw worker_ssh_command
+sudo journalctl -u keygen-worker -f
+```
 
-**NoSQL key format for get_row:** `key=[f"correlation_id:{id}"]`.
+Out of always-free capacity? `export TF_VAR_instance_shape="VM.Standard.E4.Flex"`
+(not free) before `apply.sh`.
 
 ---
 
@@ -144,11 +141,7 @@ All handlers live in `02-docker/code/func.py`. A single `handler()` dispatches o
 
 ```bash
 BASE=$(cd 03-functions && terraform output -raw api_gateway_endpoint)
-
-# Submit
 REQ=$(curl -s -X POST "$BASE/keygen" -H "Content-Type: application/json" \
   -d '{"key_type":"rsa","key_bits":2048}' | jq -r .request_id)
-
-# Poll (allow up to ~2 min for the Service Connector batch window)
-curl -s "$BASE/result/$REQ" | jq
+curl -s "$BASE/result/$REQ" | jq   # near-instant once the worker is running
 ```

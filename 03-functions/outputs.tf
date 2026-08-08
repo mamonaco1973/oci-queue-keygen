@@ -2,7 +2,7 @@
 # Outputs
 # ==============================================================================
 # api_gateway_endpoint is read by apply.sh to inject the base URL into the HTML
-# template before the 04-webapp phase, and by validate.sh for the smoke test.
+# template before the 05-webapp phase, and by validate.sh for the smoke test.
 # ==============================================================================
 
 output "api_gateway_endpoint" {

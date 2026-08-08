@@ -1,11 +1,11 @@
 # ==============================================================================
-# Phase 3: Functions — post/get Functions, NoSQL, Networking, IAM, API Gateway
+# Phase 4: Worker — always-on queue consumer on a micro-VM
 # ==============================================================================
-# Deploys the API tier.  Requires the OCIR image built in Phase 2 and the queue
-# created in Phase 1.  apply.sh supplies:
-#   TF_VAR_image_path     (from 02-docker/.build_output)
-#   TF_VAR_queue_id       (from 01-queue output)
-#   TF_VAR_queue_endpoint (from 01-queue output)
+# OCI has no native "message → invoke Function" trigger, so the key-generation
+# worker is a long-polling consumer daemon on a small (always-free) instance.
+# It drains the Queue (01-queue), generates keypairs, and writes results to the
+# NoSQL table (03-functions).  apply.sh supplies queue + table identifiers via
+# TF_VAR after those phases complete.
 # ==============================================================================
 
 terraform {
@@ -14,10 +14,17 @@ terraform {
       source  = "oracle/oci"
       version = "~> 6.0"
     }
+    tls = {
+      source  = "hashicorp/tls"
+      version = "~> 4.0"
+    }
+    local = {
+      source  = "hashicorp/local"
+      version = "~> 2.0"
+    }
   }
 }
 
-# Auth uses ~/.oci/config by default (API key mode).
 provider "oci" {
   region = var.region
 }
@@ -41,18 +48,23 @@ variable "region" {
   type        = string
 }
 
-variable "image_path" {
-  description = "Full OCIR image path including tag (built by 02-docker/build.sh)"
-  type        = string
-  default     = ""
-}
-
 variable "queue_id" {
   description = "OCID of the keygen requests queue (from 01-queue)"
   type        = string
 }
 
 variable "queue_endpoint" {
-  description = "Queue messages endpoint the post function publishes to"
+  description = "Queue messages endpoint the consumer polls (from 01-queue)"
   type        = string
+}
+
+variable "nosql_table_name" {
+  description = "OCI NoSQL table name results are written to (from 03-functions)"
+  type        = string
+}
+
+variable "instance_shape" {
+  description = "Compute shape for the worker (default is an always-free shape)"
+  type        = string
+  default     = "VM.Standard.E2.1.Micro"
 }

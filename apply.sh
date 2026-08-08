@@ -5,11 +5,11 @@
 # Purpose:
 #   Orchestrates end-to-end deployment of the async SSH KeyGen service on OCI.
 #
-#   Phase 1 (01-stream):    Creates OCIR repository + Streaming stream
+#   Phase 1 (01-queue):     Creates OCIR repository + OCI Queue
 #   Phase 2 (02-docker):    Builds the functions image and pushes it to OCIR
-#   Phase 3 (03-functions): Deploys Functions, NoSQL, VCN, IAM, API Gateway,
-#                           and the Service Connector (Streaming → worker)
-#   Phase 4 (04-webapp):    Injects API URL into HTML and deploys to Object Storage
+#   Phase 3 (03-functions): Deploys Functions (post/get), NoSQL, VCN, IAM, API GW
+#   Phase 4 (04-worker):    Deploys the micro-VM queue consumer (key generation)
+#   Phase 5 (05-webapp):    Injects API URL into HTML and deploys to Object Storage
 #
 # No environment variables are required.  Everything is derived automatically
 # from ~/.oci/config and the OCI CLI.  An OCIR auth token is created on the
@@ -89,30 +89,30 @@ export TF_VAR_region="$REGION"
 export OCIR_HOST OCIR_TOKEN OCIR_USERNAME NAMESPACE
 
 # ------------------------------------------------------------------------------
-# Phase 1: Create OCIR repository and Streaming stream
+# Phase 1: Create OCIR repository and Queue
 # ------------------------------------------------------------------------------
 
-echo "NOTE: [Phase 1/4] Creating OCIR repository and Streaming stream..."
+echo "NOTE: [Phase 1/5] Creating OCIR repository and Queue..."
 
-cd 01-stream || { echo "ERROR: 01-stream directory missing."; exit 1; }
+cd 01-queue || { echo "ERROR: 01-queue directory missing."; exit 1; }
 terraform init
 terraform apply -auto-approve
 
-# Capture stream identifiers to hand to Phase 3 (post fn + Service Connector).
-STREAM_ID=$(terraform output -raw stream_id)
-STREAM_ENDPOINT=$(terraform output -raw stream_endpoint)
+# Capture queue identifiers to hand to Phase 3 (post fn) and Phase 4 (consumer).
+QUEUE_ID=$(terraform output -raw queue_id)
+QUEUE_ENDPOINT=$(terraform output -raw queue_endpoint)
 cd ..
 
-export TF_VAR_stream_id="${STREAM_ID}"
-export TF_VAR_stream_endpoint="${STREAM_ENDPOINT}"
-echo "NOTE: Stream OCID     - ${STREAM_ID}"
-echo "NOTE: Stream endpoint - ${STREAM_ENDPOINT}"
+export TF_VAR_queue_id="${QUEUE_ID}"
+export TF_VAR_queue_endpoint="${QUEUE_ENDPOINT}"
+echo "NOTE: Queue OCID     - ${QUEUE_ID}"
+echo "NOTE: Queue endpoint - ${QUEUE_ENDPOINT}"
 
 # ------------------------------------------------------------------------------
 # Phase 2: Build and push Docker image
 # ------------------------------------------------------------------------------
 
-echo "NOTE: [Phase 2/4] Building and pushing Docker image..."
+echo "NOTE: [Phase 2/5] Building and pushing Docker image..."
 
 ./02-docker/build.sh
 
@@ -122,26 +122,41 @@ source 02-docker/.build_output
 export TF_VAR_image_path="${IMAGE_PATH}"
 
 # ------------------------------------------------------------------------------
-# Phase 3: Deploy Functions, NoSQL, API Gateway, and Service Connector
+# Phase 3: Deploy Functions, NoSQL, and API Gateway
 # ------------------------------------------------------------------------------
 
-echo "NOTE: [Phase 3/4] Deploying Functions, NoSQL, API Gateway, Connector..."
+echo "NOTE: [Phase 3/5] Deploying Functions, NoSQL, and API Gateway..."
 
 cd 03-functions || { echo "ERROR: 03-functions directory missing."; exit 1; }
 terraform init
 terraform apply -auto-approve
 API_BASE=$(terraform output -raw api_gateway_endpoint)
+NOSQL_TABLE_NAME=$(terraform output -raw nosql_table_name)
 cd ..
 
+export TF_VAR_nosql_table_name="${NOSQL_TABLE_NAME}"
 echo "NOTE: API Gateway endpoint - ${API_BASE}"
 
 # ------------------------------------------------------------------------------
-# Phase 4: Build and deploy the static web application
+# Phase 4: Deploy the worker VM (queue consumer)
+# ------------------------------------------------------------------------------
+# Needs the queue (Phase 1) and NoSQL table (Phase 3), both exported above.
 # ------------------------------------------------------------------------------
 
-echo "NOTE: [Phase 4/4] Deploying static web application..."
+echo "NOTE: [Phase 4/5] Deploying worker VM (queue consumer)..."
 
-cd 04-webapp || { echo "ERROR: 04-webapp directory missing."; exit 1; }
+cd 04-worker || { echo "ERROR: 04-worker directory missing."; exit 1; }
+terraform init
+terraform apply -auto-approve
+cd ..
+
+# ------------------------------------------------------------------------------
+# Phase 5: Build and deploy the static web application
+# ------------------------------------------------------------------------------
+
+echo "NOTE: [Phase 5/5] Deploying static web application..."
+
+cd 05-webapp || { echo "ERROR: 05-webapp directory missing."; exit 1; }
 
 export API_BASE
 envsubst '${API_BASE}' < index.html.tmpl > index.html || {
@@ -156,12 +171,10 @@ cd ..
 # ------------------------------------------------------------------------------
 # Post-deployment validation
 # ------------------------------------------------------------------------------
-# OCI Functions pull the container image from OCIR on first invocation.
-# Wait briefly to allow the cold start to complete before hitting the API.
+# Functions cold-start on first call and the worker's cloud-init takes a minute
+# to install deps + start the daemon; validate.sh polls with retries to absorb
+# both, so no fixed pre-wait is needed here.
 # ------------------------------------------------------------------------------
-
-echo "NOTE: Waiting 60s for function cold start readiness..."
-sleep 60
 
 echo "NOTE: Running post-deployment validation..."
 ./validate.sh

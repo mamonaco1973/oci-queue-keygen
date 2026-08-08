@@ -1,0 +1,49 @@
+#cloud-config
+# ==============================================================================
+# KeyGen worker bootstrap
+# ==============================================================================
+# Installs the OCI SDK + cryptography, drops the consumer daemon and its config,
+# and runs it under systemd (auto-restart).  Auth is via instance principals —
+# no credentials are written to the box.
+# ==============================================================================
+write_files:
+  # The consumer daemon (base64 to avoid YAML indentation pitfalls).
+  - path: /opt/keygen/consumer.py
+    permissions: '0755'
+    encoding: b64
+    content: ${consumer_b64}
+
+  # Runtime config consumed by the systemd unit's EnvironmentFile.
+  - path: /etc/keygen/keygen.env
+    permissions: '0644'
+    content: |
+      QUEUE_ID=${queue_id}
+      QUEUE_ENDPOINT=${queue_endpoint}
+      NOSQL_TABLE_NAME=${nosql_table_name}
+      COMPARTMENT_ID=${compartment_id}
+      OCI_REGION=${region}
+
+  - path: /etc/systemd/system/keygen-worker.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=OCI KeyGen queue consumer
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      EnvironmentFile=/etc/keygen/keygen.env
+      ExecStart=/usr/bin/python3 /opt/keygen/consumer.py
+      Restart=always
+      RestartSec=5
+      User=root
+
+      [Install]
+      WantedBy=multi-user.target
+
+runcmd:
+  - apt-get update
+  - DEBIAN_FRONTEND=noninteractive apt-get install -y python3-pip
+  - pip3 install --no-cache-dir oci cryptography
+  - systemctl daemon-reload
+  - systemctl enable --now keygen-worker.service

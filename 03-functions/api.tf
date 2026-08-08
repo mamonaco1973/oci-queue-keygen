@@ -88,5 +88,35 @@ resource "oci_apigateway_deployment" "keygen" {
         }
       }
     }
+
+    # ------------------------------------------------------------------
+    # GET /heartbeat — cold-start keep-alive for the result path
+    # ------------------------------------------------------------------
+    # Routes to the get function and injects X-Heartbeat so the handler
+    # returns a fast 200 without a NoSQL lookup.  The web client pings this
+    # on an interval to keep the polling function warm between requests.
+    # (post is not probed: it has side effects; the worker has no HTTP front.)
+    # ------------------------------------------------------------------
+    routes {
+      path    = "/heartbeat"
+      methods = ["GET"]
+
+      backend {
+        type        = "ORACLE_FUNCTIONS_BACKEND"
+        function_id = oci_functions_function.get.id
+      }
+
+      request_policies {
+        header_transformations {
+          set_headers {
+            items {
+              name      = "X-Heartbeat"
+              values    = ["1"]
+              if_exists = "OVERWRITE"
+            }
+          }
+        }
+      }
+    }
   }
 }
