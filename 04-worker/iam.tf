@@ -17,11 +17,13 @@ resource "oci_identity_dynamic_group" "worker" {
   name           = "keygen-workers-dg"
   description    = "KeyGen worker VM (instance principal auth)"
 
-  # Match by compartment, not instance OCID: in this tenancy an `instance.id`
-  # match does not resolve for the instance principal (the functions' compartment-
-  # based DG works, a single-instance-id DG does not). This mirrors the working
-  # functions DG pattern. `depends_on` keeps the instance created first.
-  matching_rule = "ALL {instance.compartment.id = '${var.compartment_id}'}"
+  # Use the generic `resource.*` variables, NOT the `instance.*` alias: in this
+  # tenancy the `instance.id` / `instance.compartment.id` aliases do NOT resolve
+  # for the instance principal (verified: the VM got 404 NotAuthorizedOrNotFound
+  # on every call), while the `resource.type` / `resource.compartment.id` form
+  # does — it's exactly how the functions DG matches (resource.type='fnfunc').
+  # So mirror that with resource.type='instance'.
+  matching_rule = "ALL {resource.type = 'instance', resource.compartment.id = '${var.compartment_id}'}"
   depends_on    = [oci_core_instance.worker]
 }
 

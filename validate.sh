@@ -52,16 +52,19 @@ fi
 
 if [ -n "${worker_ip}" ]; then
   echo "NOTE: Waiting for worker health at http://${worker_ip}:8080/health ..."
-  HEALTH_ATTEMPTS=60   # ~5 min: covers cloud-init deps install + IAM propagation
+  # ~30 min: cloud-init deps install is quick, but a brand-new dynamic group +
+  # instance principal can take many minutes to propagate on a fresh deploy.
+  HEALTH_ATTEMPTS=30      # 30 checks
+  HEALTH_INTERVAL=60      # 60s apart = up to 30 minutes
   for ((h=1; h<=HEALTH_ATTEMPTS; h++)); do
-    if curl -fsS -m 3 "http://${worker_ip}:8080/health" >/dev/null 2>&1; then
+    if curl -fsS -m 5 "http://${worker_ip}:8080/health" >/dev/null 2>&1; then
       echo "NOTE: Worker is ready."
       break
     fi
-    echo "NOTE: Worker not ready yet (${h}/${HEALTH_ATTEMPTS})..."
-    sleep 5
+    echo "NOTE: Worker not ready yet (${h}/${HEALTH_ATTEMPTS}) — waiting ${HEALTH_INTERVAL}s..."
+    sleep "${HEALTH_INTERVAL}"
     if [[ "${h}" -eq "${HEALTH_ATTEMPTS}" ]]; then
-      echo "ERROR: Worker never became healthy — check 'journalctl -u keygen-worker' on the VM."
+      echo "ERROR: Worker never became healthy after ~30 min — check 'journalctl -u keygen-worker' on the VM."
       exit 1
     fi
   done
