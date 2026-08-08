@@ -44,6 +44,8 @@ write_files:
 runcmd:
   - apt-get update
   - DEBIAN_FRONTEND=noninteractive apt-get install -y python3-pip
-  - pip3 install --no-cache-dir oci cryptography
+  # Ubuntu 24.04 enforces PEP 668 (externally-managed-environment), so a
+  # system-wide pip install is blocked without --break-system-packages.
+  - pip3 install --break-system-packages --no-cache-dir oci cryptography
   - systemctl daemon-reload
   - systemctl enable --now keygen-worker.service

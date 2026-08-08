@@ -11,11 +11,11 @@ data "oci_identity_availability_domains" "ads" {
   compartment_id = var.tenancy_ocid
 }
 
-# Latest Canonical Ubuntu 22.04 image for the chosen shape.
+# Latest Canonical Ubuntu 24.04 image for the chosen shape.
 data "oci_core_images" "ubuntu" {
   compartment_id           = var.compartment_id
   operating_system         = "Canonical Ubuntu"
-  operating_system_version = "22.04"
+  operating_system_version = "24.04"
   shape                    = var.instance_shape
   sort_by                  = "TIMECREATED"
   sort_order               = "DESC"
