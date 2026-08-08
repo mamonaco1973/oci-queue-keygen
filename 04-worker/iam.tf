@@ -23,8 +23,9 @@ resource "oci_identity_dynamic_group" "worker" {
 # ------------------------------------------------------------------------------
 # Policy — worker can consume the Queue and write NoSQL results
 # ------------------------------------------------------------------------------
-# `use queues` covers QUEUE_CONSUME (get + delete + update messages), which is
-# all the consumer needs.  manage nosql-rows lets it write completed keypairs.
+# OCI Queue's `use queues` covers produce (QUEUE_PUT) but NOT QUEUE_CONSUME, so
+# the consumer needs `manage queues` (get + delete messages). manage nosql-rows
+# lets it write completed keypairs.
 # ------------------------------------------------------------------------------
 resource "oci_identity_policy" "worker" {
   compartment_id = var.tenancy_ocid
@@ -32,7 +33,7 @@ resource "oci_identity_policy" "worker" {
   description    = "Allow the keygen worker VM to consume the Queue and write NoSQL"
 
   statements = [
-    "Allow dynamic-group keygen-workers-dg to use queues in compartment id ${var.compartment_id}",
+    "Allow dynamic-group keygen-workers-dg to manage queues in compartment id ${var.compartment_id}",
     "Allow dynamic-group keygen-workers-dg to manage nosql-rows in compartment id ${var.compartment_id}",
     "Allow dynamic-group keygen-workers-dg to use nosql-tables in compartment id ${var.compartment_id}",
   ]
