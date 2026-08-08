@@ -1,182 +1,171 @@
-# ================================================================================
+#!/bin/bash
+# ==============================================================================
 # File: apply.sh
-# ================================================================================
-# Purpose:
-#   Automates full deployment of the KeyGen service, including SQS, ECR,
-#   Lambda, API Gateway, and static web components. Each step validates
-#   its environment and applies Terraform modules in order.
 #
-# Notes:
-#   - Requires AWS CLI, Terraform, and Docker to be installed.
-#   - Assumes valid AWS credentials and permissions are configured.
-# ================================================================================
+# Purpose:
+#   Orchestrates end-to-end deployment of the async SSH KeyGen service on OCI.
+#
+#   Phase 1 (01-stream):    Creates OCIR repository + Streaming stream
+#   Phase 2 (02-docker):    Builds the functions image and pushes it to OCIR
+#   Phase 3 (03-functions): Deploys Functions, NoSQL, VCN, IAM, API Gateway,
+#                           and the Service Connector (Streaming → worker)
+#   Phase 4 (04-webapp):    Injects API URL into HTML and deploys to Object Storage
+#
+# No environment variables are required.  Everything is derived automatically
+# from ~/.oci/config and the OCI CLI.  An OCIR auth token is created on the
+# first run and saved to ~/.oci/ocir_token for reuse on subsequent runs.
+#
+# Optional env var:
+#   OCI_COMPARTMENT_ID  Defaults to tenancy OCID from ~/.oci/config when unset
+# ==============================================================================
 
-# --------------------------------------------------------------------------------
-# GLOBAL CONFIGURATION
-# --------------------------------------------------------------------------------
-# Sets the AWS region and enforces strict Bash error handling:
-#   -e : Exit immediately on command failure
-#   -u : Treat unset variables as errors
-#   -o pipefail : Catch errors in piped commands
-# --------------------------------------------------------------------------------
-export AWS_DEFAULT_REGION="us-east-1"
 set -euo pipefail
 
-# --------------------------------------------------------------------------------
-# ENVIRONMENT PRE-CHECK
-# --------------------------------------------------------------------------------
-# Ensures that required tools, variables, and credentials exist before
-# proceeding with resource deployment.
-# --------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# Environment validation
+# ------------------------------------------------------------------------------
+
 echo "NOTE: Running environment validation..."
 ./check_env.sh
-if [ $? -ne 0 ]; then
-  echo "ERROR: Environment validation failed. Exiting."
-  exit 1
+
+# ------------------------------------------------------------------------------
+# Derive OCI identifiers from ~/.oci/config
+# ------------------------------------------------------------------------------
+
+TENANCY_OCID=$(awk -F'=' '/^tenancy[[:space:]]*=/{gsub(/[[:space:]]/, "", $2); print $2; exit}' ~/.oci/config)
+REGION=$(awk -F'=' '/^region[[:space:]]*=/{gsub(/[[:space:]]/, "", $2); print $2; exit}' ~/.oci/config)
+USER_OCID=$(awk -F'=' '/^user[[:space:]]*=/{gsub(/[[:space:]]/, "", $2); print $2; exit}' ~/.oci/config)
+
+# Compartment falls back to tenancy root when OCI_COMPARTMENT_ID is not set.
+if [ -z "${OCI_COMPARTMENT_ID:-}" ]; then
+  OCI_COMPARTMENT_ID="$TENANCY_OCID"
+  echo "NOTE: OCI_COMPARTMENT_ID not set — using tenancy OCID as compartment."
 fi
 
-# --------------------------------------------------------------------------------
-# BUILD SQS AND ECR RESOURCES
-# --------------------------------------------------------------------------------
-# Initializes and applies the Terraform configuration that creates
-# SQS queues and ECR repositories required for the KeyGen workflow.
-# --------------------------------------------------------------------------------
-echo "NOTE: Building SQS and ECR resources..."
+NAMESPACE=$(oci os ns get --query 'data' --raw-output)
 
-cd 01-sqs || { echo "ERROR: 01-sqs not found."; exit 1; }
+# OCIR username: namespace/username-string (not OCID).
+USER_NAME=$(oci iam user get --user-id "${USER_OCID}" --query 'data.name' --raw-output)
+OCIR_USERNAME="${NAMESPACE}/${USER_NAME}"
+OCIR_HOST="${REGION}.ocir.io"
 
-terraform init
-terraform apply -auto-approve
+echo "NOTE: Region      - ${REGION}"
+echo "NOTE: Namespace   - ${NAMESPACE}"
+echo "NOTE: Compartment - ${OCI_COMPARTMENT_ID}"
+echo "NOTE: OCIR user   - ${OCIR_USERNAME}"
 
-cd .. || exit
+# ------------------------------------------------------------------------------
+# OCIR auth token — created once, cached in ~/.oci/ocir_token
+# ------------------------------------------------------------------------------
+# OCI auth tokens can only be read at creation time.  On first run this block
+# creates one via the OCI CLI and writes it to the cache file.  Max 2 tokens
+# per user — delete old ones in the Console if creation fails.
+# ------------------------------------------------------------------------------
 
-# --------------------------------------------------------------------------------
-# BUILD SSH-KEYGEN DOCKER IMAGE AND PUSH TO ECR
-# --------------------------------------------------------------------------------
-# Builds the ssh-keygen container image and uploads it to Amazon ECR.
-# Used later by the Lambda or ECS processor components.
-# --------------------------------------------------------------------------------
-echo "NOTE: Building ssh-keygen Docker image and pushing to ECR..."
+TOKEN_FILE="${HOME}/.oci/ocir_token"
 
-cd 02-docker/ssh-keygen || {
-  echo "ERROR: ssh-keygen directory missing."
-  exit 1
-}
-
-# Retrieve AWS account ID for ECR references
-AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query "Account" --output text)
-if [ -z "$AWS_ACCOUNT_ID" ]; then
-  echo "ERROR: Failed to retrieve AWS Account ID. Exiting."
-  exit 1
-fi
-
-# Authenticate Docker with AWS ECR using token-based login
-aws ecr get-login-password --region ${AWS_DEFAULT_REGION} | \
-docker login --username AWS --password-stdin \
-"${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com" || {
-  echo "ERROR: Docker authentication failed. Exiting."
-  exit 1
-}
-
-# ================================================================================
-# BUILD AND PUSH RSTUDIO DOCKER IMAGE (IF MISSING FROM ECR)
-# ================================================================================
-# Verifies whether the required image exists in ECR and builds/pushes it
-# only if not found. Prevents redundant uploads.
-# ================================================================================
-IMAGE_TAG="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/ssh-keygen:keygen-worker-rc1"
-
-echo "NOTE: Checking if image already exists in ECR..."
-
-# Query ECR for the image
-if aws ecr describe-images \
-    --repository-name ssh-keygen \
-    --image-ids imageTag="keygen-worker-rc1" \
-    --region "${AWS_DEFAULT_REGION}" >/dev/null 2>&1; then
-  echo "NOTE: Image already exists in ECR: ${IMAGE_TAG}"
+if [ -f "${TOKEN_FILE}" ] && [ -s "${TOKEN_FILE}" ]; then
+  echo "NOTE: Using cached OCIR token from ${TOKEN_FILE}"
+  OCIR_TOKEN=$(cat "${TOKEN_FILE}")
 else
-  echo "WARNING: Image not found in ECR. Building and pushing..."
+  echo "NOTE: No cached OCIR token found — creating one via OCI CLI..."
+  OCIR_TOKEN=$(oci iam auth-token create \
+    --user-id "${USER_OCID}" \
+    --description "keygen-ocir" \
+    --query 'data.token' \
+    --raw-output)
 
-  docker buildx build \
-  	--platform linux/amd64 \
-  	--provenance=false \
-  	--sbom=false \
-  	--output type=docker \
-  	-t "${IMAGE_TAG}" . || 
-  {
-    echo "ERROR: Docker build failed. Exiting."
-    exit 1
-  }
-
-  docker push "${IMAGE_TAG}" || {
-    echo "ERROR: Docker push failed. Exiting."
-    exit 1
-  }
-
-  echo "NOTE: Image successfully built and pushed to ECR: ${IMAGE_TAG}"
+  echo "${OCIR_TOKEN}" > "${TOKEN_FILE}"
+  chmod 600 "${TOKEN_FILE}"
+  echo "NOTE: OCIR token created and saved to ${TOKEN_FILE}"
 fi
 
-cd ../.. || exit
+# Export Terraform variables shared across all phases.
+export TF_VAR_tenancy_ocid="$TENANCY_OCID"
+export TF_VAR_compartment_id="$OCI_COMPARTMENT_ID"
+export TF_VAR_region="$REGION"
 
-# --------------------------------------------------------------------------------
-# BUILD LAMBDAS AND API GATEWAY
-# --------------------------------------------------------------------------------
-# Deploys the Lambda functions and API Gateway endpoints via Terraform.
-# --------------------------------------------------------------------------------
-echo "NOTE: Building Lambdas and API gateway..."
+# Export OCIR vars for 02-docker/build.sh.
+export OCIR_HOST OCIR_TOKEN OCIR_USERNAME NAMESPACE
 
-cd 03-lambdas || { echo "ERROR: 03-lambdas directory missing."; exit 1; }
+# ------------------------------------------------------------------------------
+# Phase 1: Create OCIR repository and Streaming stream
+# ------------------------------------------------------------------------------
 
+echo "NOTE: [Phase 1/4] Creating OCIR repository and Streaming stream..."
+
+cd 01-stream || { echo "ERROR: 01-stream directory missing."; exit 1; }
 terraform init
 terraform apply -auto-approve
 
-cd .. || exit
+# Capture stream identifiers to hand to Phase 3 (post fn + Service Connector).
+STREAM_ID=$(terraform output -raw stream_id)
+STREAM_ENDPOINT=$(terraform output -raw stream_endpoint)
+cd ..
 
-# --------------------------------------------------------------------------------
-# BUILD SIMPLE WEB APPLICATION
-# --------------------------------------------------------------------------------
-# Creates a static web client that communicates with the deployed API
-# Gateway. Substitutes the API URL into the HTML template.
-# --------------------------------------------------------------------------------
-API_ID=$(aws apigatewayv2 get-apis \
-  --query "Items[?Name=='keygen-api'].ApiId" \
-  --output text)
+export TF_VAR_stream_id="${STREAM_ID}"
+export TF_VAR_stream_endpoint="${STREAM_ENDPOINT}"
+echo "NOTE: Stream OCID     - ${STREAM_ID}"
+echo "NOTE: Stream endpoint - ${STREAM_ENDPOINT}"
 
-if [[ -z "${API_ID}" || "${API_ID}" == "None" ]]; then
-  echo "ERROR: No API found with name 'keygen-api'"
-  exit 1
-fi
+# ------------------------------------------------------------------------------
+# Phase 2: Build and push Docker image
+# ------------------------------------------------------------------------------
 
-URL=$(aws apigatewayv2 get-api \
-  --api-id "${API_ID}" \
-  --query "ApiEndpoint" \
-  --output text)
+echo "NOTE: [Phase 2/4] Building and pushing Docker image..."
 
-export API_BASE="${URL}"
-echo "NOTE: API Gateway URL - ${API_BASE}"
+./02-docker/build.sh
 
-echo "NOTE: Building Simple Web Application..."
+# Source the image path written by build.sh and pass it to Phase 3.
+# shellcheck source=/dev/null
+source 02-docker/.build_output
+export TF_VAR_image_path="${IMAGE_PATH}"
+
+# ------------------------------------------------------------------------------
+# Phase 3: Deploy Functions, NoSQL, API Gateway, and Service Connector
+# ------------------------------------------------------------------------------
+
+echo "NOTE: [Phase 3/4] Deploying Functions, NoSQL, API Gateway, Connector..."
+
+cd 03-functions || { echo "ERROR: 03-functions directory missing."; exit 1; }
+terraform init
+terraform apply -auto-approve
+API_BASE=$(terraform output -raw api_gateway_endpoint)
+cd ..
+
+echo "NOTE: API Gateway endpoint - ${API_BASE}"
+
+# ------------------------------------------------------------------------------
+# Phase 4: Build and deploy the static web application
+# ------------------------------------------------------------------------------
+
+echo "NOTE: [Phase 4/4] Deploying static web application..."
 
 cd 04-webapp || { echo "ERROR: 04-webapp directory missing."; exit 1; }
 
+export API_BASE
 envsubst '${API_BASE}' < index.html.tmpl > index.html || {
-  echo "ERROR: Failed to generate index.html file. Exiting."
+  echo "ERROR: Failed to generate index.html"
   exit 1
 }
 
 terraform init
 terraform apply -auto-approve
+cd ..
 
-cd .. || exit
+# ------------------------------------------------------------------------------
+# Post-deployment validation
+# ------------------------------------------------------------------------------
+# OCI Functions pull the container image from OCIR on first invocation.
+# Wait briefly to allow the cold start to complete before hitting the API.
+# ------------------------------------------------------------------------------
 
-# --------------------------------------------------------------------------------
-# BUILD VALIDATION
-# --------------------------------------------------------------------------------
-# Optionally runs post-deployment validation once implemented.
-# --------------------------------------------------------------------------------
-echo "NOTE: Running build validation..."
+echo "NOTE: Waiting 60s for function cold start readiness..."
+sleep 60
+
+echo "NOTE: Running post-deployment validation..."
 ./validate.sh
 
-# ================================================================================
-# END OF SCRIPT
-# ================================================================================
+# ==============================================================================
+# End of script
+# ==============================================================================

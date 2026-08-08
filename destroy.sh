@@ -1,78 +1,136 @@
 #!/bin/bash
-# ================================================================================
+# ==============================================================================
 # File: destroy.sh
-# ================================================================================
-# Purpose:
-#   Tears down all resources created by the KeyGen service deployment.
-#   Sequentially destroys Terraform-managed components and deletes
-#   the ECR repository if present.
 #
-# Notes:
-#   - Requires Terraform, AWS CLI, and valid AWS credentials.
-#   - Executes destruction in reverse order of creation.
-# ================================================================================
+# Purpose:
+#   Tears down the KeyGen stack deployed by apply.sh, in reverse phase order:
+#
+#   Phase 4 (04-webapp):    Destroy Object Storage bucket and objects
+#   Phase 3 (03-functions): Destroy Functions, NoSQL, VCN, IAM, API GW, Connector
+#   Phase 1 (01-stream):    Destroy Streaming stream + OCIR repo (images purged first)
+#
+#   Phase 2 has no Terraform state — only the Docker image in OCIR, which is
+#   deleted during the OCIR purge step before Phase 1 destroy.
+#
+# No environment variables required — all values derived from ~/.oci/config.
+# ==============================================================================
 
-# --------------------------------------------------------------------------------
-# GLOBAL CONFIGURATION
-# --------------------------------------------------------------------------------
-# Sets the AWS region and enables strict Bash error handling:
-#   -e : Exit on any command error
-#   -u : Treat unset variables as errors
-#   -o pipefail : Fail entire pipeline if any command fails
-# --------------------------------------------------------------------------------
-export AWS_DEFAULT_REGION="us-east-1"
 set -euo pipefail
 
-# --------------------------------------------------------------------------------
-# DESTROY WEB APPLICATION
-# --------------------------------------------------------------------------------
-# Destroys the S3 static web app and supporting Terraform resources
-# under the 04-webapp directory.
-# --------------------------------------------------------------------------------
-echo "NOTE: Destroying Web Application..."
+# ------------------------------------------------------------------------------
+# Derive OCI identifiers (same logic as apply.sh)
+# ------------------------------------------------------------------------------
 
-cd 04-webapp || { echo "ERROR: Directory 04-webapp not found."; exit 1; }
+TENANCY_OCID=$(awk -F'=' '/^tenancy[[:space:]]*=/{gsub(/[[:space:]]/, "", $2); print $2; exit}' ~/.oci/config)
+REGION=$(awk -F'=' '/^region[[:space:]]*=/{gsub(/[[:space:]]/, "", $2); print $2; exit}' ~/.oci/config)
+USER_OCID=$(awk -F'=' '/^user[[:space:]]*=/{gsub(/[[:space:]]/, "", $2); print $2; exit}' ~/.oci/config)
+
+if [ -z "${OCI_COMPARTMENT_ID:-}" ]; then
+  OCI_COMPARTMENT_ID="$TENANCY_OCID"
+fi
+
+export TF_VAR_tenancy_ocid="$TENANCY_OCID"
+export TF_VAR_compartment_id="$OCI_COMPARTMENT_ID"
+export TF_VAR_region="$REGION"
+
+# 03-functions needs the stream vars declared even for destroy (values unused
+# for teardown, but the variables must resolve). Pull them from 01-stream state.
+if [ -d 01-stream ]; then
+  cd 01-stream
+  export TF_VAR_stream_id="$(terraform output -raw stream_id 2>/dev/null || echo "unused")"
+  export TF_VAR_stream_endpoint="$(terraform output -raw stream_endpoint 2>/dev/null || echo "unused")"
+  cd ..
+fi
+
+# ------------------------------------------------------------------------------
+# Phase 4: Destroy static web application
+# ------------------------------------------------------------------------------
+
+echo "NOTE: [Phase 4/4] Destroying web application..."
+
+cd 04-webapp || { echo "ERROR: 04-webapp directory missing."; exit 1; }
 terraform init
 terraform destroy -auto-approve
-cd .. || exit
+cd ..
 
-# --------------------------------------------------------------------------------
-# DESTROY LAMBDAS AND API GATEWAY
-# --------------------------------------------------------------------------------
-# Removes the Lambda functions and associated API Gateway routes
-# created during deployment.
-# --------------------------------------------------------------------------------
-echo "NOTE: Destroying Lambdas and API Gateway..."
+# ------------------------------------------------------------------------------
+# Phase 3: Destroy Functions, NoSQL, API Gateway, Connector
+# ------------------------------------------------------------------------------
 
-cd 03-lambdas || { echo "ERROR: Directory 03-lambdas not found."; exit 1; }
+echo "NOTE: [Phase 3/4] Destroying Functions, NoSQL, API Gateway, Connector..."
+
+cd 03-functions || { echo "ERROR: 03-functions directory missing."; exit 1; }
+terraform init
+# Retry once — OCI IAM ETag optimistic locking causes spurious 412 failures
+# on policy deletes when OCI modifies the resource between read and delete.
+terraform destroy -auto-approve || terraform destroy -auto-approve
+cd ..
+
+# ------------------------------------------------------------------------------
+# Purge OCIR images before Phase 1 destroy
+# ------------------------------------------------------------------------------
+# Terraform cannot delete an OCIR repository while it still contains images.
+# ------------------------------------------------------------------------------
+
+echo "NOTE: Purging OCIR images from keygen-functions repository..."
+
+IMAGE_IDS=$(oci artifacts container image list \
+  --compartment-id "${OCI_COMPARTMENT_ID}" \
+  --all \
+  --query 'data.items[].id' \
+  --output json 2>/dev/null | \
+  jq -r '.[] // empty' 2>/dev/null || true)
+
+if [[ -n "${IMAGE_IDS}" ]]; then
+  echo "${IMAGE_IDS}" | while read -r IMG_ID; do
+    echo "NOTE: Deleting image ${IMG_ID}..."
+    oci artifacts container image delete \
+      --image-id "${IMG_ID}" \
+      --force 2>/dev/null || true
+  done
+else
+  echo "NOTE: No OCIR images found to delete."
+fi
+
+# ------------------------------------------------------------------------------
+# Phase 1: Destroy Streaming stream and OCIR repository
+# ------------------------------------------------------------------------------
+
+echo "NOTE: [Phase 1/4] Destroying Streaming stream and OCIR repository..."
+
+cd 01-stream || { echo "ERROR: 01-stream directory missing."; exit 1; }
 terraform init
 terraform destroy -auto-approve
-cd .. || exit
+cd ..
 
-# --------------------------------------------------------------------------------
-# DESTROY SQS AND ECR RESOURCES
-# --------------------------------------------------------------------------------
-# Deletes the ECR repository (if it exists) and destroys the SQS
-# queues and related Terraform resources.
-# --------------------------------------------------------------------------------
-aws ecr delete-repository --repository-name "ssh-keygen" --force || {
-  echo "WARN: Failed to delete ECR repository. It may not exist."
-}
-
-echo "NOTE: Destroying SQS and ECR..."
-
-cd 01-sqs || { echo "ERROR: Directory 01-sqs not found."; exit 1; }
-terraform init
-terraform destroy -auto-approve
-cd .. || exit
-
-# --------------------------------------------------------------------------------
-# COMPLETION
-# --------------------------------------------------------------------------------
-# Confirms successful teardown of all Terraform-managed resources.
-# --------------------------------------------------------------------------------
 echo "NOTE: Infrastructure teardown complete."
 
-# ================================================================================
-# END OF SCRIPT
-# ================================================================================
+# ------------------------------------------------------------------------------
+# Delete OCIR auth token and remove local cache
+# ------------------------------------------------------------------------------
+
+echo "NOTE: Deleting OCIR auth token..."
+
+TOKEN_FILE="${HOME}/.oci/ocir_token"
+
+TOKEN_ID=$(oci iam auth-token list \
+  --user-id "${USER_OCID}" \
+  --query "data[?description=='keygen-ocir'].id | [0]" \
+  --raw-output 2>/dev/null || echo "")
+
+if [[ -n "${TOKEN_ID}" && "${TOKEN_ID}" != "null" ]]; then
+  oci iam auth-token delete \
+    --user-id "${USER_OCID}" \
+    --auth-token-id "${TOKEN_ID}" \
+    --force
+  echo "NOTE: OCIR auth token deleted."
+else
+  echo "NOTE: No keygen-ocir auth token found — skipping."
+fi
+
+rm -f "${TOKEN_FILE}"
+echo "NOTE: Removed cached token file ${TOKEN_FILE}."
+
+# ==============================================================================
+# End of script
+# ==============================================================================

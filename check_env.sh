@@ -1,40 +1,42 @@
 #!/bin/bash
+# ==============================================================================
+# File: check_env.sh
+#
+# Purpose:
+#   Pre-flight validation.  Confirms required tools are available and the
+#   OCI CLI is configured and reachable.
+#
+# Required tools: oci, terraform, docker, jq, envsubst
+# ==============================================================================
 
-echo "NOTE: Validating that required commands are found in your PATH."
-# List of required commands
-commands=("aws" "terraform" "docker" "jq")
+set -euo pipefail
 
-# Flag to track if all commands are found
-all_found=true
+# ------------------------------------------------------------------------------
+# Tool checks
+# ------------------------------------------------------------------------------
 
-# Iterate through each command and check if it's available
+echo "NOTE: Validating required commands in PATH."
+
+commands=("oci" "terraform" "docker" "jq" "envsubst")
+
 for cmd in "${commands[@]}"; do
-  if ! command -v "$cmd" &> /dev/null; then
-    echo "ERROR: $cmd is not found in the current PATH."
-    all_found=false
-  else
-    echo "NOTE: $cmd is found in the current PATH."
+  if ! command -v "${cmd}" >/dev/null 2>&1; then
+    echo "ERROR: Required command not found: ${cmd}"
+    exit 1
   fi
+  echo "NOTE: Found required command: ${cmd}"
 done
 
-# Final status
-if [ "$all_found" = true ]; then
-  echo "NOTE: All required commands are available."
-else
-  echo "ERROR: One or more commands are missing."
+echo "NOTE: All required commands are available."
+
+# ------------------------------------------------------------------------------
+# OCI CLI connectivity check
+# ------------------------------------------------------------------------------
+
+echo "NOTE: Checking OCI CLI connection."
+if ! oci os ns get > /dev/null 2>&1; then
+  echo "ERROR: Failed to connect to OCI. Check your ~/.oci/config."
   exit 1
 fi
 
-echo "NOTE: Checking AWS cli connection."
-
-aws sts get-caller-identity --query "Account" --output text >> /dev/null
-
-# Check the return code of the login command
-if [ $? -ne 0 ]; then
-  echo "ERROR: Failed to connect to AWS. Please check your credentials and environment variables."
-  exit 1
-else
-  echo "NOTE: Successfully logged into AWS."
-fi
-
-
+echo "NOTE: OCI CLI authentication successful."

@@ -8,3 +8,9 @@
 *.zip
 index.html
 
+# Build artifact written by 02-docker/build.sh
+02-docker/.build_output
+
+# Python bytecode
+__pycache__/
+*.pyc

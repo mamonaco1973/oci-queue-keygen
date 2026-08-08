@@ -1,125 +1,136 @@
-<!-- =============================================================================
- index.html
- Simple client for AWS Keygen API
-============================================================================= -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>Key Generator</title>
-<style>
-body { font-family: sans-serif; max-width: 700px; margin: 2em auto; }
-label { display: block; margin-top: 1em; }
-button { margin-top: 1em; padding: 0.5em 1em; }
-textarea {
-  width: 100%;
-  font-family: monospace;
-  white-space: pre-wrap;
-  word-break: break-all;
-  background: #f5f5f5;
-  padding: 1em;
-  box-sizing: border-box;
-}
-#status { margin-top: 1em; font-weight: bold; }
-.copy-btn {
-  margin-top: 0.5em;
-  padding: 0.4em 0.8em;
-  font-size: 0.9em;
-}
-</style>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OCI KeyGen — Async SSH Key Generation</title>
+  <link rel="icon" href="favicon.ico" />
+  <style>
+    :root { --bg:#0a0e14; --panel:#141b26; --edge:#26303f; --gold:#f4c430;
+            --text:#e8eef6; --dim:#93a1b3; --ok:#78c88c; --err:#e06048; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+           background: var(--bg); color: var(--text); line-height:1.5; }
+    .wrap { max-width: 760px; margin: 0 auto; padding: 32px 20px 64px; }
+    h1 { font-size: 1.6rem; margin: 0 0 4px; }
+    .sub { color: var(--dim); margin: 0 0 28px; font-size: .95rem; }
+    .card { background: var(--panel); border:1px solid var(--edge);
+            border-radius: 12px; padding: 22px; margin-bottom: 20px; }
+    label { display:block; font-size:.85rem; color: var(--dim); margin: 0 0 6px; }
+    .row { display:flex; gap:16px; flex-wrap:wrap; }
+    .row > div { flex:1; min-width: 160px; }
+    select, button { width:100%; padding:12px 14px; border-radius:8px;
+            border:1px solid var(--edge); background:#0e141d; color:var(--text);
+            font-size:1rem; }
+    button { background: var(--gold); color:#101010; border:none; font-weight:700;
+             cursor:pointer; margin-top: 8px; }
+    button:disabled { opacity:.55; cursor:not-allowed; }
+    .status { margin-top:14px; font-size:.9rem; color: var(--dim); min-height:1.2em; }
+    .status.ok { color: var(--ok); }
+    .status.err { color: var(--err); }
+    .keyblock { display:none; margin-top:18px; }
+    .keyblock h3 { margin:0 0 6px; font-size:.9rem; color: var(--gold); }
+    textarea { width:100%; height:140px; resize:vertical; font-family: ui-monospace,
+            Consolas, monospace; font-size:.8rem; background:#0e141d; color:var(--text);
+            border:1px solid var(--edge); border-radius:8px; padding:12px; }
+    .hint { font-size:.8rem; color:var(--dim); margin-top:8px; word-break:break-all; }
+  </style>
 </head>
 <body>
-<h2>Generate SSH Keypair</h2>
+  <div class="wrap">
+    <h1>OCI KeyGen</h1>
+    <p class="sub">Asynchronous SSH keypair generation — API Gateway → Streaming →
+      Service Connector Hub → Functions → NoSQL.</p>
 
-<label>
-  Select key type:
-  <select id="keyType">
-    <option value="rsa-2048">RSA 2048-bit</option>
-    <option value="rsa-4096">RSA 4096-bit</option>
-    <option value="ed25519">Ed25519</option>
-  </select>
-</label>
+    <div class="card">
+      <div class="row">
+        <div>
+          <label for="key_type">Key type</label>
+          <select id="key_type">
+            <option value="rsa">RSA</option>
+            <option value="ed25519">ED25519</option>
+          </select>
+        </div>
+        <div>
+          <label for="key_bits">RSA size (ignored for ed25519)</label>
+          <select id="key_bits">
+            <option value="2048">2048</option>
+            <option value="4096">4096</option>
+          </select>
+        </div>
+      </div>
+      <button id="go">Generate keypair</button>
+      <div class="status" id="status"></div>
+    </div>
 
-<button id="generateBtn">Generate Keypair</button>
+    <div class="card keyblock" id="result">
+      <div class="keyblock" id="pubblock" style="display:block">
+        <h3>Public key (OpenSSH)</h3>
+        <textarea id="pub" readonly></textarea>
+      </div>
+      <div class="keyblock" id="privblock" style="display:block; margin-top:16px">
+        <h3>Private key (PEM)</h3>
+        <textarea id="priv" readonly></textarea>
+      </div>
+      <p class="hint" id="reqid"></p>
+    </div>
+  </div>
 
-<div id="status"></div>
+  <script>
+    // API_BASE is injected at deploy time by apply.sh (envsubst).
+    const API_BASE = "${API_BASE}";
 
-<!-- -----------------------------------------------------------------------------
- Public Key Section
------------------------------------------------------------------------------ -->
-<h3>Public Key</h3>
-<textarea id="pubKey" rows="3" readonly></textarea>
-<button class="copy-btn"
-  onclick="navigator.clipboard.writeText(document.getElementById('pubKey').value)">
-  Copy Public Key
-</button>
+    const $ = (id) => document.getElementById(id);
+    const setStatus = (msg, cls) => { const s = $("status");
+      s.textContent = msg; s.className = "status" + (cls ? " " + cls : ""); };
 
-<!-- -----------------------------------------------------------------------------
- Private Key Section
------------------------------------------------------------------------------ -->
-<h3>Private Key</h3>
-<textarea id="privKey" rows="15" readonly></textarea>
-<button class="copy-btn"
-  onclick="navigator.clipboard.writeText(document.getElementById('privKey').value)">
-  Copy Private Key
-</button>
-
-<script>
-// -----------------------------------------------------------------------------
-// Utility: sleep
-// -----------------------------------------------------------------------------
-const sleep = ms => new Promise(r => setTimeout(r, ms));
-
-// -----------------------------------------------------------------------------
-// Generate Keypair handler
-// -----------------------------------------------------------------------------
-document.getElementById("generateBtn").onclick = async () => {
-  const sel = document.getElementById("keyType").value;
-  const [type, bits] = sel.split("-");
-  document.getElementById("status").textContent = "Requesting keypair...";
-
-  try {
-    // -----------------------------------------------------------
-    // Step 1: POST /keygen
-    // -----------------------------------------------------------
-    const resp = await fetch(`${API_BASE}/keygen`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ key_type: type, key_bits: Number(bits) })
-    });
-    const data = await resp.json();
-    const id = data.request_id;
-    document.getElementById("status").textContent =
-      `Request ID: ${id} (waiting...)`;
-
-    // -----------------------------------------------------------
-    // Step 2: Poll /result/{id}
-    // -----------------------------------------------------------
-    let ready = false, result;
-    for (let i = 0; i < 20; i++) {
-      await sleep(1500);
-      const res = await fetch(`${API_BASE}/result/${id}`);
-      result = await res.json();
-      if (result.status !== "pending") { ready = true; break; }
+    // Poll GET /result/{id} until the worker has written the result (202 → 200).
+    async function poll(reqId, attempt = 0) {
+      const MAX = 90, DELAY = 2000;   // ~3 min; covers SCH batch window + cold start
+      const res = await fetch(`${API_BASE}/result/${reqId}`);
+      if (res.status === 200) {
+        const data = await res.json();
+        if (data.status === "complete") return data;
+      }
+      if (attempt >= MAX) throw new Error("Timed out waiting for key generation.");
+      setStatus(`Working… (${attempt + 1})`, null);
+      await new Promise((r) => setTimeout(r, DELAY));
+      return poll(reqId, attempt + 1);
     }
 
-    // -----------------------------------------------------------
-    // Step 3: Display results
-    // -----------------------------------------------------------
-    if (ready) {
-      document.getElementById("status").textContent = "Keypair ready!";
-      document.getElementById("pubKey").value = atob(result.public_key_b64);
-      document.getElementById("privKey").value = atob(result.private_key_b64);
-    } else {
-      document.getElementById("status").textContent =
-        "Timed out waiting for result.";
+    async function generate() {
+      $("go").disabled = true;
+      $("result").style.display = "none";
+      setStatus("Submitting request…", null);
+      try {
+        const body = {
+          key_type: $("key_type").value,
+          key_bits: parseInt($("key_bits").value, 10),
+        };
+        const res = await fetch(`${API_BASE}/keygen`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        const { request_id } = await res.json();
+        if (!request_id) throw new Error("No request_id returned.");
+        setStatus(`Queued (${request_id}) — polling…`, null);
+
+        const result = await poll(request_id);
+        // Keys are stored base64-encoded; decode for display.
+        $("pub").value = atob(result.public_key_b64 || "");
+        $("priv").value = atob(result.private_key_b64 || "");
+        $("reqid").textContent = "request_id: " + request_id;
+        $("result").style.display = "block";
+        setStatus("Key generation complete.", "ok");
+      } catch (e) {
+        setStatus(e.message || "Request failed.", "err");
+      } finally {
+        $("go").disabled = false;
+      }
     }
-  } catch (err) {
-    document.getElementById("status").textContent =
-      "Error: " + err.message;
-  }
-};
-</script>
+
+    $("go").addEventListener("click", generate);
+  </script>
 </body>
 </html>
