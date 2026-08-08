@@ -186,10 +186,13 @@ def post_handler(ctx, data: io.BytesIO = None):
         body = {}
 
     corr_id = str(uuid.uuid4())
+    # key_bits may arrive missing or null (the web client sends null for the
+    # ed25519 option) — coerce to the default rather than crashing on int(None).
+    key_bits = body.get("key_bits") or 2048
     msg = {
         "correlation_id": corr_id,
         "key_type": body.get("key_type", "rsa"),
-        "key_bits": int(body.get("key_bits", 2048)),
+        "key_bits": int(key_bits),
     }
 
     # OCI Queue message content is a plain string (no base64 required, unlike
