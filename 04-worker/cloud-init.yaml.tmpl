@@ -50,5 +50,9 @@ runcmd:
   - DEBIAN_FRONTEND=noninteractive apt-get install -y python3-venv
   - python3 -m venv /opt/keygen/venv
   - /opt/keygen/venv/bin/pip install --no-cache-dir oci cryptography
+  # The OCI Ubuntu image's default iptables only allows SSH inbound; open the
+  # health port (the OCI Security List rule alone isn't enough — two firewalls).
+  - iptables -I INPUT -p tcp --dport 8080 -j ACCEPT
+  - netfilter-persistent save || true
   - systemctl daemon-reload
   - systemctl enable --now keygen-worker.service
