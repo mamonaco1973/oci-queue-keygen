@@ -55,6 +55,19 @@ resource "oci_core_security_list" "worker" {
       max = 22
     }
   }
+
+  # Health endpoint — validate.sh polls this to confirm the consumer is ready
+  # to process before submitting. Returns only "ready"/"starting", no data.
+  ingress_security_rules {
+    protocol  = "6" # TCP
+    source    = "0.0.0.0/0"
+    stateless = false
+
+    tcp_options {
+      min = 8080
+      max = 8080
+    }
+  }
 }
 
 resource "oci_core_subnet" "worker" {

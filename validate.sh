@@ -36,6 +36,40 @@ fi
 echo "NOTE: API Gateway URL - ${api_url}"
 
 # ------------------------------------------------------------------------------
+# Step 0b: Wait for the worker to report healthy before submitting
+# ------------------------------------------------------------------------------
+# The worker's /health endpoint returns 200 only after its first successful
+# authorized queue poll — i.e. deps installed, instance-principal auth
+# propagated, queue reachable.  This distinguishes "still booting" from "broken"
+# and avoids submitting into a void on a fresh deploy.
+# ------------------------------------------------------------------------------
+worker_ip=""
+if [ -d 04-worker ]; then
+  cd 04-worker
+  worker_ip="$(terraform output -raw worker_public_ip 2>/dev/null || echo "")"
+  cd ..
+fi
+
+if [ -n "${worker_ip}" ]; then
+  echo "NOTE: Waiting for worker health at http://${worker_ip}:8080/health ..."
+  HEALTH_ATTEMPTS=60   # ~5 min: covers cloud-init deps install + IAM propagation
+  for ((h=1; h<=HEALTH_ATTEMPTS; h++)); do
+    if curl -fsS -m 3 "http://${worker_ip}:8080/health" >/dev/null 2>&1; then
+      echo "NOTE: Worker is ready."
+      break
+    fi
+    echo "NOTE: Worker not ready yet (${h}/${HEALTH_ATTEMPTS})..."
+    sleep 5
+    if [[ "${h}" -eq "${HEALTH_ATTEMPTS}" ]]; then
+      echo "ERROR: Worker never became healthy — check 'journalctl -u keygen-worker' on the VM."
+      exit 1
+    fi
+  done
+else
+  echo "WARN: worker_public_ip output not found — skipping health gate."
+fi
+
+# ------------------------------------------------------------------------------
 # Step 1: Submit an SSH key generation request
 # ------------------------------------------------------------------------------
 KEY_TYPE="${KEY_TYPE:-rsa}"

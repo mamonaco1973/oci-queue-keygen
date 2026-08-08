@@ -23,8 +23,10 @@ Config (from /etc/keygen/keygen.env via the systemd unit):
 import json
 import base64
 import os
+import threading
 import time
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import oci
 from oci.auth.signers import InstancePrincipalsSecurityTokenSigner
@@ -51,6 +53,36 @@ _signer = InstancePrincipalsSecurityTokenSigner()
 _queue = QueueClient(config={}, signer=_signer, service_endpoint=QUEUE_ENDPOINT)
 # NoSQL client needs a region to resolve its endpoint under instance principals.
 _nosql = NosqlClient(config={"region": REGION}, signer=_signer)
+
+# ---------------------------------------------------------------------------
+# Health endpoint
+# ---------------------------------------------------------------------------
+# A tiny HTTP server so validate.sh (and humans) can tell the worker is not
+# just booted but genuinely able to process: _ready flips to True only after
+# the FIRST successful authorized queue poll — proving deps installed, instance-
+# principal auth propagated, and the queue is reachable.  Until then it 503s.
+
+HEALTH_PORT = int(os.environ.get("HEALTH_PORT", "8080"))
+_ready = False
+
+
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):  # noqa: N802 - http.server naming
+        code = 200 if _ready else 503
+        body = (b'{"status":"ready"}' if _ready else b'{"status":"starting"}')
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):  # silence per-request access logging
+        pass
+
+
+def _start_health_server() -> None:
+    """Serve the health endpoint forever (runs in a daemon thread)."""
+    HTTPServer(("0.0.0.0", HEALTH_PORT), _HealthHandler).serve_forever()
 
 
 def generate_keypair(key_type: str = "rsa", key_bits: int = 2048):
@@ -115,7 +147,13 @@ def process(content: str) -> None:
 
 def main() -> None:
     """Drain the queue forever: long-poll → process → delete (ack)."""
+    global _ready
     print("keygen consumer starting", flush=True)
+
+    # Health endpoint comes up immediately (serving 503 until the first
+    # successful poll below flips _ready to True).
+    threading.Thread(target=_start_health_server, daemon=True).start()
+
     while True:
         try:
             resp = _queue.get_messages(
@@ -124,6 +162,10 @@ def main() -> None:
                 visibility_in_seconds=VISIBILITY_SECONDS,
                 limit=BATCH_LIMIT,
             )
+            # A successful poll proves auth + connectivity — signal readiness.
+            if not _ready:
+                _ready = True
+                print("worker ready (first successful poll)", flush=True)
             for m in (resp.data.messages or []):
                 try:
                     process(m.content)

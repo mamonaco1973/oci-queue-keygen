@@ -33,7 +33,7 @@ write_files:
 
       [Service]
       EnvironmentFile=/etc/keygen/keygen.env
-      ExecStart=/usr/bin/python3 /opt/keygen/consumer.py
+      ExecStart=/opt/keygen/venv/bin/python /opt/keygen/consumer.py
       Restart=always
       RestartSec=5
       User=root
@@ -42,10 +42,13 @@ write_files:
       WantedBy=multi-user.target
 
 runcmd:
+  # Install into a venv, NOT the system Python. On Ubuntu 24.04 a system-wide
+  # pip install fails: oci needs a newer urllib3, and pip cannot uninstall the
+  # apt-managed urllib3 (no RECORD file) even with --break-system-packages. A
+  # venv sidesteps PEP 668 and the apt-vs-pip conflict entirely.
   - apt-get update
-  - DEBIAN_FRONTEND=noninteractive apt-get install -y python3-pip
-  # Ubuntu 24.04 enforces PEP 668 (externally-managed-environment), so a
-  # system-wide pip install is blocked without --break-system-packages.
-  - pip3 install --break-system-packages --no-cache-dir oci cryptography
+  - DEBIAN_FRONTEND=noninteractive apt-get install -y python3-venv
+  - python3 -m venv /opt/keygen/venv
+  - /opt/keygen/venv/bin/pip install --no-cache-dir oci cryptography
   - systemctl daemon-reload
   - systemctl enable --now keygen-worker.service
