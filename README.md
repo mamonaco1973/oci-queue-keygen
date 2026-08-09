@@ -1,4 +1,4 @@
-# OCI SSH KeyGen Microservice — Queue, Functions, NoSQL, API Gateway, VM Consumer
+# OCI Async SSH KeyGen Microservice
 
 This project delivers an automated **asynchronous SSH key generation service**
 on OCI, powered by **OCI Queue**, **OCI Functions**, **OCI NoSQL Database**,
@@ -56,20 +56,7 @@ so processing is near-instant without hammering the Queue API.
 
 ## Architecture
 
-```
-Browser / curl
-     │
-     ▼
-OCI API Gateway (PUBLIC)
-     ├── POST /keygen      → keygen-post ──put──► OCI Queue (keygen-requests)
-     │                                                    │  long-poll
-     │                                                    ▼
-     │                                        Worker VM (systemd consumer)
-     │                                        generate keypair ──► OCI NoSQL
-     │                                                                   ▲
-     └── GET /result/{id}  → keygen-get ──────────read───────────────────┘
-     └── GET /heartbeat    → keygen-get  (fast 200, keeps the get fn warm)
-```
+![OCI KeyGen Diagram](oci-queue-keygen.png)
 
 1. **POST `/keygen`** — the post function generates a `request_id` (UUID4),
    puts the request on the Queue, and returns **202 Accepted** immediately.
