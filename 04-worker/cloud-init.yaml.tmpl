@@ -46,10 +46,25 @@ runcmd:
   # pip install fails: oci needs a newer urllib3, and pip cannot uninstall the
   # apt-managed urllib3 (no RECORD file) even with --break-system-packages. A
   # venv sidesteps PEP 668 and the apt-vs-pip conflict entirely.
-  - apt-get update
-  - DEBIAN_FRONTEND=noninteractive apt-get install -y python3-venv
+  #
+  # Retry apt update+install in a bounded loop: on a flaky boot the mirror/index
+  # isn't ready when this first runs, which surfaced as "python3.12-venv has no
+  # installation candidate" and left the venv without pip. Retrying defeats that
+  # transience deterministically instead of relying on boot timing. Name the
+  # versioned package (24.04 = 3.12) so it never depends on the metapackage.
+  - |
+    for i in $(seq 1 30); do
+      apt-get update && \
+      DEBIAN_FRONTEND=noninteractive apt-get install -y python3.12-venv && break
+      echo "apt attempt $i failed — retrying in 10s"; sleep 10
+    done
   - python3 -m venv /opt/keygen/venv
-  - /opt/keygen/venv/bin/pip install --no-cache-dir oci cryptography
+  # Retry the pip install too — same transient-network reasoning as apt above.
+  - |
+    for i in $(seq 1 30); do
+      /opt/keygen/venv/bin/pip install --no-cache-dir oci cryptography && break
+      echo "pip attempt $i failed — retrying in 10s"; sleep 10
+    done
   # The OCI Ubuntu image's default iptables only allows SSH inbound; open the
   # health port (the OCI Security List rule alone isn't enough — two firewalls).
   - iptables -I INPUT -p tcp --dport 8080 -j ACCEPT

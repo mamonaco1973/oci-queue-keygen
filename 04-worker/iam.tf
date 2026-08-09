@@ -17,13 +17,14 @@ resource "oci_identity_dynamic_group" "worker" {
   name           = "keygen-workers-dg"
   description    = "KeyGen worker VM (instance principal auth)"
 
-  # Use the generic `resource.*` variables, NOT the `instance.*` alias: in this
-  # tenancy the `instance.id` / `instance.compartment.id` aliases do NOT resolve
-  # for the instance principal (verified: the VM got 404 NotAuthorizedOrNotFound
-  # on every call), while the `resource.type` / `resource.compartment.id` form
-  # does — it's exactly how the functions DG matches (resource.type='fnfunc').
-  # So mirror that with resource.type='instance'.
-  matching_rule = "ALL {resource.type = 'instance', resource.compartment.id = '${var.compartment_id}'}"
+  # Match compute instances with the `instance.*` variables — NOT `resource.type`.
+  # `resource.type = 'instance'` is NOT a valid match for a compute instance
+  # (that form works for service principals like functions, where the type is
+  # 'fnfunc'); with it the VM's instance principal gets 404 NotAuthorizedOrNotFound
+  # on every authorized call. `instance.compartment.id` is the canonical form and
+  # was verified to resolve for this VM (direct NoSQL get_table succeeded once the
+  # DG used it, with no temporary any-user policy in play).
+  matching_rule = "ALL {instance.compartment.id = '${var.compartment_id}'}"
   depends_on    = [oci_core_instance.worker]
 }
 
