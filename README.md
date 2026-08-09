@@ -14,17 +14,33 @@ This is the OCI port of [`aws-sqs-keygen`](https://github.com/mamonaco1973/aws-s
 
 The AWS original relies on an **SQS→Lambda event-source mapping**: a message on
 the queue automatically invokes the worker in milliseconds. **OCI has no
-equivalent.** Two hard facts drove this design:
+first-class equivalent.** Two facts drove this design:
 
-- **OCI Queue cannot trigger anything** — nothing polls it for you.
-- **Service Connector Hub** *can* invoke a Function, but it's a batching service
-  with a **60-second-minimum** window, so it added ~30s of latency per request
-  (we tried it first — it was unusable).
+- **OCI Queue has no native compute trigger** — you must provide a consumer, or
+  bridge it with an intermediary. There's no Functions config that auto-consumes
+  the queue and invokes a worker the way SQS→Lambda does.
+- **Service Connector Hub** *can* bridge Queue→Functions, but it's a
+  batching/data-movement service, not a low-latency event-source mapping. Its
+  batch time is configurable, yet in our testing we consistently observed **~30s
+  or more** between enqueue and invocation — unacceptable for on-demand keygen.
+  (Queue only became a valid Connector Hub source in Feb 2024.)
 
 The fix that's both fast **and** cheap: keep `post`/`get` as serverless
-Functions, and run the worker as a **long-polling consumer on an always-free
-micro-VM**. `GetMessages` returns the instant a message arrives, so processing
-is near-instant, and on an always-free shape the always-on worker costs nothing.
+Functions, and run the worker as a **long-polling consumer on a micro-VM**. OCI
+Queue supports polling waits up to 30s that return the instant a message appears,
+so processing is near-instant without hammering the Queue API.
+
+> **The real substitution:** the VM isn't here because keygen *needs* a VM — it's
+> implementing the piece of Lambda's control plane (the event-source mapping)
+> that OCI Functions doesn't provide. AWS gives you a *managed* consumer; on OCI
+> you bring your own.
+
+> **Cost footnote:** `VM.Standard.E2.1.Micro` is Always Free eligible (up to two
+> instances), so the demo worker is effectively $0. Note that Oracle may reclaim
+> Always Free compute that stays below its utilization thresholds over a 7-day
+> window — a consumer blocked in long-poll can look idle — so treat the free
+> shape as an excellent demo/zero-cost option, with a small paid shape
+> (`export TF_VAR_instance_shape=...`) as the production fallback.
 
 | AWS building block | OCI equivalent used here |
 |--------------------|--------------------------|

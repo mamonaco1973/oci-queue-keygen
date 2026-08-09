@@ -58,9 +58,11 @@ _nosql = NosqlClient(config={"region": REGION}, signer=_signer)
 # Health endpoint
 # ---------------------------------------------------------------------------
 # A tiny HTTP server so validate.sh (and humans) can tell the worker is not
-# just booted but genuinely able to process: _ready flips to True only after
-# the FIRST successful authorized queue poll — proving deps installed, instance-
-# principal auth propagated, and the queue is reachable.  Until then it 503s.
+# just booted but genuinely able to process.  The server only starts once
+# main() has confirmed NoSQL access (a successful get_table), so a reachable
+# /health returning 200 means deps installed, instance-principal auth is live,
+# and writes will succeed.  Before that the process exits/restarts, so callers
+# get connection-refused (treated as "not ready yet") rather than a false 200.
 
 HEALTH_PORT = int(os.environ.get("HEALTH_PORT", "8080"))
 _ready = False
@@ -150,9 +152,29 @@ def main() -> None:
     global _ready
     print("keygen consumer starting", flush=True)
 
-    # Health endpoint comes up immediately (serving 503 until the first
-    # successful poll below flips _ready to True).
+    # Fresh-deploy auth race guard.  The instance-principal token is minted when
+    # this process starts and caches the grants/dynamic-group membership that are
+    # live at that instant.  On a clean build the daemon boots seconds after the
+    # DG + policy are created — before the NoSQL grant has actually propagated —
+    # so a token minted then 404s on every write for its whole lifetime (the
+    # signer reuses the cached token).  Queue authz lands sooner, which masked
+    # this: the boot token had working queue access but dead NoSQL access.  Fix:
+    # prove NoSQL access before serving; if it isn't ready, exit and let systemd
+    # (Restart=always) restart us with a FRESH token until the grant is live.
+    # This self-heals a clean deploy with no manual restart, and makes /health
+    # honest — 200 only once writes actually work.
+    try:
+        _nosql.get_table(table_name_or_id=TABLE_NAME, compartment_id=COMPARTMENT_ID)
+    except Exception as exc:  # noqa: BLE001 - any failure means "not ready yet"
+        print(f"nosql access not ready ({exc}); exiting for systemd restart",
+              flush=True)
+        time.sleep(2)  # short pace: catch readiness within ~2s of it landing
+        raise SystemExit(1)
+
+    # NoSQL is confirmed reachable — only now bring up health (200) and consume.
     threading.Thread(target=_start_health_server, daemon=True).start()
+    _ready = True
+    print("worker ready (nosql + queue authorized)", flush=True)
 
     while True:
         try:
@@ -162,10 +184,6 @@ def main() -> None:
                 visibility_in_seconds=VISIBILITY_SECONDS,
                 limit=BATCH_LIMIT,
             )
-            # A successful poll proves auth + connectivity — signal readiness.
-            if not _ready:
-                _ready = True
-                print("worker ready (first successful poll)", flush=True)
             for m in (resp.data.messages or []):
                 try:
                     process(m.content)

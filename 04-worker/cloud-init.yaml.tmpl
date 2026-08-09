@@ -35,7 +35,7 @@ write_files:
       EnvironmentFile=/etc/keygen/keygen.env
       ExecStart=/opt/keygen/venv/bin/python /opt/keygen/consumer.py
       Restart=always
-      RestartSec=5
+      RestartSec=2
       User=root
 
       [Install]

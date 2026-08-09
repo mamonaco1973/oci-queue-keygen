@@ -7,11 +7,12 @@ micro-VM** generates the keypair and stores it in **OCI NoSQL**; the client
 polls a result endpoint until the keys are ready.
 
 > **Design history:** the AWS original uses an SQS→Lambda event-source mapping
-> (instant trigger). OCI has no equivalent — Queue can't trigger anything, and
-> Service Connector Hub (the only thing that can invoke a Function) batches on a
-> 60s-minimum window (~30s latency, unusable). So the worker is a long-polling
-> VM consumer instead of a serverless function: `GetMessages` returns the
-> instant a message arrives, and on an always-free shape it's effectively $0.
+> (instant trigger). OCI has no first-class equivalent — Queue has no native
+> compute trigger, and Service Connector Hub can bridge Queue→Functions but is a
+> batching service (batch time configurable, yet ~30s+ observed in testing,
+> unusable here). So the worker is a long-polling VM consumer instead of a
+> serverless function: `GetMessages` returns the instant a message arrives, and
+> on an always-free shape it's effectively $0 (with the idle-reclaim caveat).
 > An earlier Streaming+SCH iteration was abandoned for this reason. The repo may
 > still be named for "queue"/"streaming"; the current design is **Queue + VM**.
 

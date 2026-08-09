@@ -24,8 +24,12 @@ resource "oci_identity_dynamic_group" "worker" {
   # on every authorized call. `instance.compartment.id` is the canonical form and
   # was verified to resolve for this VM (direct NoSQL get_table succeeded once the
   # DG used it, with no temporary any-user policy in play).
+  # Deliberately NO depends_on the instance: the rule matches by compartment, so
+  # the DG doesn't need the VM to exist. Creating the DG + policy FIRST lets the
+  # grant propagate during instance provisioning + cloud-init (minutes of head
+  # start), so NoSQL authz is usually live before the daemon's first run — which
+  # avoids the instance-principal token booting before the grant is recognized.
   matching_rule = "ALL {instance.compartment.id = '${var.compartment_id}'}"
-  depends_on    = [oci_core_instance.worker]
 }
 
 # ------------------------------------------------------------------------------
