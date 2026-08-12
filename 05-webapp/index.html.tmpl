@@ -1,69 +1,223 @@
 <!-- =============================================================================
  index.html
- Simple client for OCI Keygen API
+ Client for the OCI Keygen API.
+
+ Layout note: the page is a full-height flex column and NEVER scrolls itself.
+ The two key panels flex to fill whatever space is left and scroll internally,
+ so a 50-line RSA-4096 private key and a 3-line Ed25519 key both sit in the
+ same frame with no manual resizing and no layout shift between runs.
 ============================================================================= -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
+<meta name="color-scheme" content="dark" />
 <title>Key Generator</title>
 <style>
-body { font-family: sans-serif; max-width: 700px; margin: 2em auto; }
-label { display: block; margin-top: 1em; }
-button { margin-top: 1em; padding: 0.5em 1em; }
+/* ---------------------------------------------------------------------------
+   Palette — matches the video's title cards so a cut from the app to a slide
+   is a tonal match rather than a white-to-black flash.
+   --------------------------------------------------------------------------- */
+:root {
+  --bg:     #0A0E14;
+  --panel:  #121A24;
+  --border: #223142;
+  --text:   #E6EDF3;
+  --muted:  #8FA0B4;
+  --gold:   #F5B700;
+}
+
+* { box-sizing: border-box; }
+
+html, body { height: 100%; }
+
+/* Belt-and-braces: flex items will not shrink below their min-content width
+   unless told to, which is how a long unbroken key string turns into sideways
+   scroll. word-break already prevents it here; this keeps it true if the
+   markup or content changes. */
+body > *, .controls > *, .panel > * { min-width: 0; }
+
+/* Type scales with the viewport: sized to stay legible when a 1080p screen
+   recording is watched full-frame on a phone, not for phone browsing. */
+body {
+  margin: 0;
+  padding: clamp(14px, 2.5vw, 28px);
+  /* Fixed height + hidden overflow, NOT min-height: min-height lets the body
+     grow past the viewport and the page scrolls again, which is the exact
+     thing this layout exists to prevent. */
+  height: 100dvh;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  gap: clamp(10px, 1.6vh, 18px);
+  background: var(--bg);
+  color: var(--text);
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-size: clamp(16px, 1.15vw, 21px);
+  line-height: 1.4;
+}
+
+h1 {
+  margin: 0;
+  font-size: clamp(1.5rem, 2.6vw, 2.3rem);
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+/* Controls sit on one row so the fold stays shallow and the status line —
+   the number this whole demo exists to show — stays high in frame. */
+.controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: clamp(10px, 1.5vw, 16px);
+}
+
+.controls label { color: var(--muted); font-weight: 600; }
+
+select, button {
+  font: inherit;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  padding: 0.55em 0.9em;
+}
+
+select {
+  background: var(--panel);
+  color: var(--text);
+}
+
+#generateBtn {
+  background: var(--gold);
+  border-color: var(--gold);
+  color: #10131A;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+#generateBtn:hover { filter: brightness(1.08); }
+
+/* The elapsed time is the hero of the shot — oversized and gold so it reads
+   at phone scale. min-height reserves its line so nothing jumps when it fills. */
+#status {
+  min-height: 1.5em;
+  font-size: clamp(1.15rem, 1.9vw, 1.7rem);
+  font-weight: 700;
+  color: var(--gold);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Public key gets 1 share of the leftover height, private key 3 — a wrapped
+   RSA-4096 public key needs about four lines, the matching private key about
+   fifty, so this keeps both boxes mostly full rather than one padded with
+   dead space and the other clipped. */
+.panel {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;              /* lets the textarea shrink inside the flex row */
+  gap: 6px;
+}
+.panel.pub  { flex: 1 1 0; }
+.panel.priv { flex: 3 1 0; }
+
+.panel-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.panel-head h2 {
+  margin: 0;
+  font-size: clamp(0.95rem, 1.2vw, 1.15rem);
+  font-weight: 600;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+/* Copy sits on the heading row, not below the box — keeps it off the vertical
+   budget so the panels get the space instead. */
+.copy-btn {
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 0.3em 0.7em;
+  font-size: 0.8em;
+}
+.copy-btn:hover { color: var(--text); border-color: var(--muted); }
+
 textarea {
+  flex: 1 1 auto;
+  min-height: 0;
   width: 100%;
-  font-family: monospace;
+  resize: none;               /* the flex layout sizes these, not the user */
+  overflow: auto;
+  padding: clamp(10px, 1.2vw, 16px);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel);
+  color: var(--text);
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: clamp(0.8rem, 0.95vw, 1rem);
+  line-height: 1.45;
   white-space: pre-wrap;
   word-break: break-all;
-  background: #f5f5f5;
-  padding: 1em;
-  box-sizing: border-box;
 }
-#status { margin-top: 1em; font-weight: bold; }
-.copy-btn {
-  margin-top: 0.5em;
-  padding: 0.4em 0.8em;
-  font-size: 0.9em;
+
+textarea:focus { outline: 1px solid var(--gold); }
+
+/* Stack the controls on narrow screens so nothing is squeezed unreadable. */
+@media (max-width: 560px) {
+  .controls { flex-direction: column; align-items: stretch; }
+  #generateBtn { width: 100%; }
 }
 </style>
 </head>
 <body>
-<h2>Generate SSH Keypair</h2>
 
-<label>
-  Select key type:
+<h1>Generate SSH Keypair</h1>
+
+<div class="controls">
+  <label for="keyType">Key type</label>
   <select id="keyType">
     <option value="rsa-2048">RSA 2048-bit</option>
     <option value="rsa-4096">RSA 4096-bit</option>
     <option value="ed25519">Ed25519</option>
   </select>
-</label>
-
-<button id="generateBtn">Generate Keypair</button>
+  <button id="generateBtn">Generate Keypair</button>
+</div>
 
 <div id="status"></div>
 
 <!-- -----------------------------------------------------------------------------
  Public Key Section
 ----------------------------------------------------------------------------- -->
-<h3>Public Key</h3>
-<textarea id="pubKey" rows="3" readonly></textarea>
-<button class="copy-btn"
-  onclick="navigator.clipboard.writeText(document.getElementById('pubKey').value)">
-  Copy Public Key
-</button>
+<section class="panel pub">
+  <div class="panel-head">
+    <h2>Public Key</h2>
+    <button class="copy-btn"
+      onclick="navigator.clipboard.writeText(document.getElementById('pubKey').value)">
+      Copy
+    </button>
+  </div>
+  <textarea id="pubKey" readonly></textarea>
+</section>
 
 <!-- -----------------------------------------------------------------------------
  Private Key Section
 ----------------------------------------------------------------------------- -->
-<h3>Private Key</h3>
-<textarea id="privKey" rows="15" readonly></textarea>
-<button class="copy-btn"
-  onclick="navigator.clipboard.writeText(document.getElementById('privKey').value)">
-  Copy Private Key
-</button>
+<section class="panel priv">
+  <div class="panel-head">
+    <h2>Private Key</h2>
+    <button class="copy-btn"
+      onclick="navigator.clipboard.writeText(document.getElementById('privKey').value)">
+      Copy
+    </button>
+  </div>
+  <textarea id="privKey" readonly></textarea>
+</section>
 
 <script>
 // -----------------------------------------------------------------------------
@@ -99,6 +253,12 @@ document.getElementById("generateBtn").onclick = async () => {
   const sel = document.getElementById("keyType").value;
   const [type, bits] = sel.split("-");
   document.getElementById("status").textContent = "Requesting keypair...";
+
+  // Clear the previous run's keys before waiting.  Leaving them on screen
+  // makes a pending request look already-complete — misleading in the UI and
+  // actively wrong on camera, where the fill-in is the visible proof of work.
+  document.getElementById("pubKey").value = "";
+  document.getElementById("privKey").value = "";
 
   // Clock starts at the click, not at the fetch — this measures what the user
   // actually waits for, which is the number the VM-vs-SCH comparison is about.
