@@ -1,2 +1,6 @@
 fdk>=0.1.70
 oci>=2.100.0
+# Only the `worker` handler (PROCESSING_MODE=sch) generates keys in-process;
+# post/get import it lazily so their cold start is unchanged.  Keep this in
+# step with the version cloud-init installs for 04-worker/consumer.py.
+cryptography>=42.0.0

@@ -11,10 +11,17 @@
 #   - curl, jq, terraform, OCI CLI (authenticated); deployment completed.
 #
 # Note on timing:
-#   The async path is API GW → post fn → Queue → VM consumer (long-poll) → NoSQL.
-#   Steady-state latency is near-instant, but on the FIRST deploy the worker's
-#   cloud-init needs a minute or two to install deps and start the daemon, so
-#   the poll loop is patient.
+#   vm  mode: API GW → post fn → Queue → VM consumer (long-poll) → NoSQL.
+#             Steady-state latency is near-instant, but on the FIRST deploy the
+#             worker's cloud-init needs a minute or two to install deps and
+#             start the daemon, so the poll loop is patient.
+#   sch mode: API GW → post fn → Queue → Connector Hub (batch) → worker fn →
+#             NoSQL.  Slower by construction — a request waits for the batch
+#             window before compute starts.
+#
+#   This is a pass/fail smoke test, not a benchmark: it polls on a coarse 5s
+#   interval and cannot resolve the difference between the modes.  For that,
+#   use the web client — it logs millisecond timings to the browser console.
 # ==============================================================================
 
 set -euo pipefail
@@ -42,15 +49,29 @@ echo "NOTE: API Gateway URL - ${api_url}"
 # authorized queue poll — i.e. deps installed, instance-principal auth
 # propagated, queue reachable.  This distinguishes "still booting" from "broken"
 # and avoids submitting into a void on a fresh deploy.
+#
+# sch mode has no equivalent gate: the connector has no readiness signal, and
+# its worker function is provisioned synchronously by Terraform.  The retry
+# budget in Step 2 absorbs the batch window instead.
 # ------------------------------------------------------------------------------
+PROCESSING_MODE="${PROCESSING_MODE:-vm}"
+
 worker_ip=""
-if [ -d 04-worker ]; then
+if [ "${PROCESSING_MODE}" = "vm" ] && [ -d 04-worker ]; then
   cd 04-worker
   worker_ip="$(terraform output -raw worker_public_ip 2>/dev/null || echo "")"
   cd ..
 fi
 
-if [ -n "${worker_ip}" ]; then
+if [ "${PROCESSING_MODE}" = "sch" ]; then
+  echo "NOTE: Mode is 'sch' — skipping VM health gate."
+  if [ -d 04-sch ]; then
+    cd 04-sch
+    echo "NOTE: Connector state - $(terraform output -raw connector_state 2>/dev/null || echo unknown)"
+    echo "NOTE: Batch settings  - $(terraform output -raw batch_settings 2>/dev/null || echo unknown)"
+    cd ..
+  fi
+elif [ -n "${worker_ip}" ]; then
   echo "NOTE: Waiting for worker health at http://${worker_ip}:8080/health ..."
   # ~30 min: cloud-init deps install is quick, but a brand-new dynamic group +
   # instance principal can take many minutes to propagate on a fresh deploy.

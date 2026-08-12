@@ -72,6 +72,20 @@ textarea {
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 // -----------------------------------------------------------------------------
+// Poll schedule
+// -----------------------------------------------------------------------------
+// The first read fires immediately and early retries are 250ms apart: the VM
+// consumer often finishes before a slower tick could observe it, and a fixed
+// delay would report latency the backend never actually had.  Intervals widen
+// after 3s so the long wait in SCH mode doesn't hammer the API.
+//
+// The deadline must exceed Connector Hub's batch time limit (60s default) or
+// SCH mode reports a timeout instead of a measurement.
+// -----------------------------------------------------------------------------
+const POLL_DEADLINE_MS = 120000;
+const pollDelay = elapsed => (elapsed < 3000 ? 250 : 1000);
+
+// -----------------------------------------------------------------------------
 // Keep-alive: ping /heartbeat once a minute so the result (polling) function
 // stays warm between requests. OCI Functions cold-start on first invocation;
 // this keeps the get function hot so polling doesn't pay that penalty.
@@ -86,6 +100,10 @@ document.getElementById("generateBtn").onclick = async () => {
   const [type, bits] = sel.split("-");
   document.getElementById("status").textContent = "Requesting keypair...";
 
+  // Clock starts at the click, not at the fetch — this measures what the user
+  // actually waits for, which is the number the VM-vs-SCH comparison is about.
+  const t0 = performance.now();
+
   try {
     // -----------------------------------------------------------
     // Step 1: POST /keygen
@@ -97,32 +115,55 @@ document.getElementById("generateBtn").onclick = async () => {
     });
     const data = await resp.json();
     const id = data.request_id;
+
+    const tQueued = performance.now();
+    console.log(`[timing] enqueue (POST /keygen 202): ` +
+                `${(tQueued - t0).toFixed(0)}ms — id ${id}`);
+
     document.getElementById("status").textContent =
       `Request ID: ${id} (waiting...)`;
 
     // -----------------------------------------------------------
     // Step 2: Poll /result/{id}
     // -----------------------------------------------------------
-    let ready = false, result;
-    for (let i = 0; i < 20; i++) {
-      await sleep(1500);
+    let ready = false, result, polls = 0;
+    const deadline = t0 + POLL_DEADLINE_MS;
+
+    while (performance.now() < deadline) {
       const res = await fetch(`${API_BASE}/result/${id}`);
       result = await res.json();
+      polls++;
       if (result.status !== "pending") { ready = true; break; }
+      await sleep(pollDelay(performance.now() - t0));
     }
 
     // -----------------------------------------------------------
     // Step 3: Display results
     // -----------------------------------------------------------
     if (ready) {
-      document.getElementById("status").textContent = "Keypair ready!";
+      const total = performance.now() - t0;
+      // Processing time is quantised by the poll interval, so it is an upper
+      // bound: the worker finished somewhere inside the last poll gap.
+      console.log(`[timing] key received: ${total.toFixed(0)}ms total ` +
+                  `(${polls} poll${polls === 1 ? "" : "s"})`);
+      console.log(`[timing]   enqueue ${(tQueued - t0).toFixed(0)}ms + ` +
+                  `process/poll ${(performance.now() - tQueued).toFixed(0)}ms ` +
+                  `(+/- one poll interval)`);
+
+      document.getElementById("status").textContent =
+        `Keypair ready in ${(total / 1000).toFixed(2)}s`;
       document.getElementById("pubKey").value = atob(result.public_key_b64);
       document.getElementById("privKey").value = atob(result.private_key_b64);
     } else {
+      const total = performance.now() - t0;
+      console.log(`[timing] TIMED OUT after ${total.toFixed(0)}ms ` +
+                  `(${polls} polls)`);
       document.getElementById("status").textContent =
-        "Timed out waiting for result.";
+        `Timed out after ${(total / 1000).toFixed(0)}s.`;
     }
   } catch (err) {
+    console.log(`[timing] failed after ` +
+                `${(performance.now() - t0).toFixed(0)}ms: ${err.message}`);
     document.getElementById("status").textContent =
       "Error: " + err.message;
   }

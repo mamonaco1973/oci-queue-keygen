@@ -39,10 +39,12 @@ Environment variables:
     QUEUE_ENDPOINT    Queue messages endpoint            (post)
 """
 
+import base64
 import io
 import json
 import os
 import uuid
+from datetime import datetime, timezone
 
 # Import only the specific SDK pieces we use rather than the whole `oci`
 # package — trims cold-start import time on OCI Functions.
@@ -50,6 +52,7 @@ from fdk import response
 from oci.auth.signers import get_resource_principals_signer
 from oci.exceptions import ServiceError
 from oci.nosql import NosqlClient
+from oci.nosql.models import UpdateRowDetails
 from oci.queue import QueueClient
 from oci.queue.models import PutMessagesDetails, PutMessagesDetailsEntry
 
@@ -152,8 +155,9 @@ def handler(ctx, data: io.BytesIO = None):
     """
     func_type = os.environ.get("FUNCTION_TYPE", "").strip()
     dispatch = {
-        "post": post_handler,
-        "get":  get_handler,
+        "post":   post_handler,
+        "get":    get_handler,
+        "worker": worker_handler,
     }
     fn = dispatch.get(func_type)
     if fn is None:
@@ -256,3 +260,156 @@ def get_handler(ctx, data: io.BytesIO = None):
         return _resp(ctx, 202, {"status": "pending", "correlation_id": corr_id})
 
     return _resp(ctx, 200, item)
+
+
+# ---------------------------------------------------------------------------
+# worker — Connector Hub target (PROCESSING_MODE=sch only)
+# ---------------------------------------------------------------------------
+# The serverless alternative to the 04-worker VM consumer.  Connector Hub reads
+# the Queue on a batch schedule and invokes this function with a JSON list of
+# messages.  Deployed only by 04-sch; in VM mode this handler is never reached.
+#
+# Two behavioural differences from consumer.py that are NOT incidental:
+#
+#   1. Batching — one invocation carries up to `batch_size_in_num` messages,
+#      so this iterates where the consumer handles one message at a time.
+#   2. Acking — Connector Hub owns the read/delete cycle.  This function must
+#      NOT delete messages; raising instead signals failure so the connector
+#      can redeliver.  The VM consumer, by contrast, deletes explicitly.
+#
+# generate_keypair() is duplicated from 04-worker/consumer.py rather than
+# shared: the two run in different deployment units (container image vs. a file
+# dropped by cloud-init) with no common package.  Keep them in step.
+# ---------------------------------------------------------------------------
+
+def _generate_keypair(key_type: str = "rsa", key_bits: int = 2048):
+    """Generate an SSH keypair and return (public_openssh, private_pem).
+
+    `cryptography` is imported here rather than at module scope so the post and
+    get containers never pay its import cost at cold start — which would
+    otherwise skew the VM-vs-SCH latency comparison this mode exists to make.
+
+    Args:
+        key_type : "rsa" or "ed25519"; unknown values fall back to RSA.
+        key_bits : RSA modulus size (ignored for ed25519).
+
+    Returns:
+        tuple[str, str]: OpenSSH public key and PEM private key.
+    """
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ed25519, rsa
+
+    if key_type == "ed25519":
+        priv = ed25519.Ed25519PrivateKey.generate()
+        priv_format = serialization.PrivateFormat.PKCS8
+    else:
+        priv = rsa.generate_private_key(public_exponent=65537, key_size=key_bits)
+        priv_format = serialization.PrivateFormat.TraditionalOpenSSL
+
+    pub_ssh = priv.public_key().public_bytes(
+        serialization.Encoding.OpenSSH,
+        serialization.PublicFormat.OpenSSH,
+    ).decode()
+
+    priv_pem = priv.private_bytes(
+        serialization.Encoding.PEM,
+        priv_format,
+        serialization.NoEncryption(),
+    ).decode()
+
+    return pub_ssh, priv_pem
+
+
+def _iter_requests(payload):
+    """Yield request dicts from a Connector Hub batch payload.
+
+    The connector delivers a JSON list per invocation, but the element shape for
+    a QueueSource is not contractually pinned in the docs: an entry may be the
+    queue message envelope ({"content": "<json>"}), the decoded request itself,
+    or a bare JSON string.  All three are normalised here so a change in the
+    envelope degrades to a logged skip rather than a silently dropped batch.
+
+    Args:
+        payload: Parsed JSON body delivered by Connector Hub.
+
+    Yields:
+        dict: One keygen request ({"correlation_id", "key_type", "key_bits"}).
+    """
+    entries = payload if isinstance(payload, list) else [payload]
+
+    for entry in entries:
+        if isinstance(entry, str):
+            try:
+                entry = json.loads(entry)
+            except ValueError:
+                print(f"worker: skipping unparseable entry: {entry!r}")
+                continue
+
+        if not isinstance(entry, dict):
+            print(f"worker: skipping unexpected entry type: {type(entry)}")
+            continue
+
+        # Queue message envelope — the request is JSON inside `content`.
+        if "correlation_id" not in entry and "content" in entry:
+            try:
+                entry = json.loads(entry["content"])
+            except (ValueError, TypeError):
+                print(f"worker: skipping bad content: {entry.get('content')!r}")
+                continue
+
+        if isinstance(entry, dict) and entry.get("correlation_id"):
+            yield entry
+        else:
+            print(f"worker: skipping entry with no correlation_id: {entry!r}")
+
+
+def worker_handler(ctx, data: io.BytesIO = None):
+    """Generate keypairs for a Connector Hub batch and store them in NoSQL.
+
+    Args:
+        ctx  : FDK invoke context.
+        data : JSON list of queue messages delivered by Connector Hub.
+
+    Returns:
+        fdk.response.Response: 200 with a per-batch processed count.
+
+    Raises:
+        Exception: Propagated when a write fails, so Connector Hub treats the
+            invocation as failed and can redeliver the batch.
+    """
+    try:
+        raw = data.getvalue() if data else b"[]"
+        payload = json.loads(raw or b"[]")
+    except (ValueError, json.JSONDecodeError):
+        return _resp(ctx, 400, {"error": "Malformed batch payload"})
+
+    processed = 0
+    for req in _iter_requests(payload):
+        corr_id  = str(req["correlation_id"]).strip()
+        key_type = str(req.get("key_type", "rsa"))
+        # May arrive null from the web client's ed25519 option — coerce rather
+        # than crash on int(None), matching post_handler.
+        key_bits = int(req.get("key_bits") or 2048)
+
+        pub, priv = _generate_keypair(key_type, key_bits)
+
+        # Let a write failure propagate: a 5xx tells Connector Hub the batch
+        # was not handled, which is the only retry lever available here.
+        _nosql.update_row(
+            table_name_or_id=TABLE_NAME,
+            update_row_details=UpdateRowDetails(
+                value={
+                    "correlation_id":  corr_id,
+                    "status":          "complete",
+                    "key_type":        key_type,
+                    "public_key_b64":  base64.b64encode(pub.encode()).decode(),
+                    "private_key_b64": base64.b64encode(priv.encode()).decode(),
+                    "created_at":      datetime.now(timezone.utc).isoformat(),
+                },
+                compartment_id=COMPARTMENT_ID,
+            ),
+        )
+        processed += 1
+        print(f"worker: processed {corr_id} ({key_type}-{key_bits})")
+
+    return _resp(ctx, 200, {"processed": processed})

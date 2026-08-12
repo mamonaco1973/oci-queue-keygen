@@ -8,18 +8,57 @@
 #   Phase 1 (01-queue):     Creates OCIR repository + OCI Queue
 #   Phase 2 (02-docker):    Builds the functions image and pushes it to OCIR
 #   Phase 3 (03-functions): Deploys Functions (post/get), NoSQL, VCN, IAM, API GW
-#   Phase 4 (04-worker):    Deploys the micro-VM queue consumer (key generation)
+#   Phase 4:                Deploys the queue processor — see PROCESSING_MODE
 #   Phase 5 (05-webapp):    Injects API URL into HTML and deploys to Object Storage
 #
 # No environment variables are required.  Everything is derived automatically
 # from ~/.oci/config and the OCI CLI.  An OCIR auth token is created on the
 # first run and saved to ~/.oci/ocir_token for reuse on subsequent runs.
 #
-# Optional env var:
+# Optional env vars:
 #   OCI_COMPARTMENT_ID  Defaults to tenancy OCID from ~/.oci/config when unset
+#   PROCESSING_MODE     vm (default) | sch — which Phase 4 to deploy
 # ==============================================================================
 
 set -euo pipefail
+
+# ------------------------------------------------------------------------------
+# Processing mode — how a queued request reaches compute
+# ------------------------------------------------------------------------------
+#   vm  → 04-worker: a long-polling consumer daemon on a micro-VM.
+#   sch → 04-sch:    Connector Hub batching Queue → worker Function.
+#
+# The two are mutually exclusive and live in separate state, so this is a shell
+# variable rather than a Terraform one: it decides which directory Phase 4
+# enters, which Terraform cannot do from inside a module.
+# ------------------------------------------------------------------------------
+
+PROCESSING_MODE="${PROCESSING_MODE:-vm}"
+
+case "${PROCESSING_MODE}" in
+  vm)  PHASE4_DIR="04-worker"; PHASE4_OTHER="04-sch"    ;;
+  sch) PHASE4_DIR="04-sch";    PHASE4_OTHER="04-worker" ;;
+  *)
+    echo "ERROR: PROCESSING_MODE must be 'vm' or 'sch' (got '${PROCESSING_MODE}')."
+    exit 1
+    ;;
+esac
+
+# Refuse to run alongside the other mode.  Both consume the same queue, so a
+# stranded VM would silently steal messages from the connector (or vice versa)
+# and the latency numbers would be measuring a race, not a design.
+if [ -f "${PHASE4_OTHER}/terraform.tfstate" ] && \
+   [ "$(jq -r '.resources | length' "${PHASE4_OTHER}/terraform.tfstate" 2>/dev/null || echo 0)" != "0" ]; then
+  echo "ERROR: ${PHASE4_OTHER} still has deployed resources."
+  echo "NOTE: Both modes consume the same queue — run ./destroy.sh first,"
+  echo "NOTE: then re-apply with PROCESSING_MODE=${PROCESSING_MODE}."
+  exit 1
+fi
+
+# validate.sh gates the worker health check on this, so it must be inherited.
+export PROCESSING_MODE
+
+echo "NOTE: Processing mode - ${PROCESSING_MODE} (Phase 4 = ${PHASE4_DIR})"
 
 # ------------------------------------------------------------------------------
 # Environment validation
@@ -132,20 +171,25 @@ terraform init
 terraform apply -auto-approve
 API_BASE=$(terraform output -raw api_gateway_endpoint)
 NOSQL_TABLE_NAME=$(terraform output -raw nosql_table_name)
+FUNCTIONS_APP_ID=$(terraform output -raw functions_application_id)
 cd ..
 
 export TF_VAR_nosql_table_name="${NOSQL_TABLE_NAME}"
+# Only 04-sch consumes this, but exporting unconditionally keeps the phase
+# hand-off uniform across modes.
+export TF_VAR_functions_application_id="${FUNCTIONS_APP_ID}"
 echo "NOTE: API Gateway endpoint - ${API_BASE}"
 
 # ------------------------------------------------------------------------------
-# Phase 4: Deploy the worker VM (queue consumer)
+# Phase 4: Deploy the queue processor (mode-dependent)
 # ------------------------------------------------------------------------------
 # Needs the queue (Phase 1) and NoSQL table (Phase 3), both exported above.
+# 04-sch additionally needs the image path and Functions Application OCID.
 # ------------------------------------------------------------------------------
 
-echo "NOTE: [Phase 4/5] Deploying worker VM (queue consumer)..."
+echo "NOTE: [Phase 4/5] Deploying queue processor (${PROCESSING_MODE})..."
 
-cd 04-worker || { echo "ERROR: 04-worker directory missing."; exit 1; }
+cd "${PHASE4_DIR}" || { echo "ERROR: ${PHASE4_DIR} directory missing."; exit 1; }
 terraform init
 terraform apply -auto-approve
 cd ..

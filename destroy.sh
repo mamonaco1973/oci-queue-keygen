@@ -6,7 +6,8 @@
 #   Tears down the KeyGen stack deployed by apply.sh, in reverse phase order:
 #
 #   Phase 5 (05-webapp):    Destroy Object Storage bucket and objects
-#   Phase 4 (04-worker):    Destroy the worker VM, its VCN, and IAM
+#   Phase 4 (04-worker |    Destroy the queue processor — BOTH directories are
+#            04-sch):       attempted, so a mode switch cannot strand resources
 #   Phase 3 (03-functions): Destroy Functions, NoSQL, VCN, IAM, API Gateway
 #   Phase 1 (01-queue):     Destroy Queue + OCIR repo (images purged first)
 #
@@ -45,6 +46,10 @@ fi
 if [ -d 03-functions ]; then
   cd 03-functions
   export TF_VAR_nosql_table_name="$(terraform output -raw nosql_table_name 2>/dev/null || echo keygen_results)"
+  # 04-sch declares these as required with no default; they are unused for a
+  # destroy but must still resolve, and 03-functions may already be gone.
+  export TF_VAR_functions_application_id="$(terraform output -raw functions_application_id 2>/dev/null || echo unused)"
+  export TF_VAR_image_path="$(terraform output -raw ocir_image_path 2>/dev/null || echo unused)"
   cd ..
 fi
 
@@ -60,15 +65,32 @@ terraform destroy -auto-approve
 cd ..
 
 # ------------------------------------------------------------------------------
-# Phase 4: Destroy the worker VM
+# Phase 4: Destroy the queue processor (both modes)
+# ------------------------------------------------------------------------------
+# Deliberately mode-agnostic: destroy is also how you switch modes, and reading
+# PROCESSING_MODE here would leave the *other* mode's resources running while
+# apply.sh refuses to proceed because of them.  Directories with no state are
+# skipped, so this is a no-op for whichever mode was never deployed.
 # ------------------------------------------------------------------------------
 
-echo "NOTE: [Phase 4/5] Destroying worker VM..."
+echo "NOTE: [Phase 4/5] Destroying queue processor..."
 
-cd 04-worker || { echo "ERROR: 04-worker directory missing."; exit 1; }
-terraform init
-terraform destroy -auto-approve || terraform destroy -auto-approve
-cd ..
+for phase4 in 04-worker 04-sch; do
+  if [ ! -f "${phase4}/terraform.tfstate" ]; then
+    echo "NOTE: ${phase4} has no state — skipping."
+    continue
+  fi
+  if [ "$(jq -r '.resources | length' "${phase4}/terraform.tfstate" 2>/dev/null || echo 0)" = "0" ]; then
+    echo "NOTE: ${phase4} state is empty — skipping."
+    continue
+  fi
+
+  echo "NOTE: Destroying ${phase4}..."
+  cd "${phase4}"
+  terraform init
+  terraform destroy -auto-approve || terraform destroy -auto-approve
+  cd ..
+done
 
 # ------------------------------------------------------------------------------
 # Phase 3: Destroy Functions, NoSQL, API Gateway

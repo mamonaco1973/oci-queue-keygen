@@ -30,6 +30,29 @@ Functions, and run the worker as a **long-polling consumer on a micro-VM**. OCI
 Queue supports polling waits up to 30s that return the instant a message appears,
 so processing is near-instant without hammering the Queue API.
 
+### Don't take our word for it — deploy both
+
+`PROCESSING_MODE` selects which Phase 4 gets deployed, so the claim above is
+measurable rather than asserted:
+
+```bash
+PROCESSING_MODE=vm  ./apply.sh   # default: long-polling consumer on a micro-VM
+PROCESSING_MODE=sch ./apply.sh   # Connector Hub batching Queue → worker Function
+```
+
+Both modes serve the identical API and web client. The web client logs
+millisecond timings to the **browser console** (`[timing] …`) and shows the
+elapsed time on the page, so you can compare the two end to end from the same UI.
+
+The modes are mutually exclusive — they consume the same queue, so `apply.sh`
+refuses to deploy one while the other is up. Run `./destroy.sh` (which tears
+down whichever is deployed) before switching.
+
+`04-sch` defaults to the **most aggressive** batch settings Connector Hub
+accepts (`batch_time_in_sec=5`, `batch_size_in_num=1`), not the service defaults
+— comparing against a 60s default batch window would be stacking the deck. Set
+`TF_VAR_batch_time_in_sec=60` to see out-of-the-box behaviour.
+
 > **The real substitution:** the VM isn't here because keygen *needs* a VM — it's
 > implementing the piece of Lambda's control plane (the event-source mapping)
 > that OCI Functions doesn't provide. AWS gives you a *managed* consumer; on OCI
@@ -118,7 +141,9 @@ Optional: `export OCI_COMPARTMENT_ID=ocid1.compartment...` (defaults to tenancy 
 1. **01-queue** — OCIR repository + OCI Queue
 2. **02-docker** — build the functions image, push to OCIR
 3. **03-functions** — Functions (post/get), NoSQL, VCN, API Gateway, IAM
-4. **04-worker** — the queue-consumer VM (cloud-init installs + starts the daemon)
+4. **04-worker** *(mode `vm`)* — the queue-consumer VM (cloud-init installs +
+   starts the daemon), **or** **04-sch** *(mode `sch`)* — Connector Hub +
+   worker Function
 5. **05-webapp** — inject the API URL into the HTML, deploy to Object Storage
 
 ## The worker VM
