@@ -25,15 +25,20 @@ set -euo pipefail
 # ------------------------------------------------------------------------------
 # Processing mode — how a queued request reaches compute
 # ------------------------------------------------------------------------------
+#   sch → 04-sch:    Connector Hub Queue → worker Function.  DEFAULT.
 #   vm  → 04-worker: a long-polling consumer daemon on a micro-VM.
-#   sch → 04-sch:    Connector Hub batching Queue → worker Function.
+#
+# sch is the default because it is the fully managed path and, with a
+# one-message batch size, lands at 1-2s end to end — close enough to the VM's
+# sub-second that the operational cost of running a VM is hard to justify.
+# vm remains supported and is still the lower-latency option.
 #
 # The two are mutually exclusive and live in separate state, so this is a shell
 # variable rather than a Terraform one: it decides which directory Phase 4
 # enters, which Terraform cannot do from inside a module.
 # ------------------------------------------------------------------------------
 
-PROCESSING_MODE="${PROCESSING_MODE:-vm}"
+PROCESSING_MODE="${PROCESSING_MODE:-sch}"
 
 case "${PROCESSING_MODE}" in
   vm)  PHASE4_DIR="04-worker"; PHASE4_OTHER="04-sch"    ;;

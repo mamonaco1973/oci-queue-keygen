@@ -54,7 +54,26 @@ echo "NOTE: API Gateway URL - ${api_url}"
 # its worker function is provisioned synchronously by Terraform.  The retry
 # budget in Step 2 absorbs the batch window instead.
 # ------------------------------------------------------------------------------
-PROCESSING_MODE="${PROCESSING_MODE:-vm}"
+# Detect the mode from state rather than defaulting to it.  apply.sh exports
+# PROCESSING_MODE, but run standalone this script has no such hint — and
+# guessing wrong skips the health gate on a vm deploy (or waits for a VM that
+# sch mode never created).  Whichever phase-4 directory holds resources IS the
+# deployed mode; the env var only breaks a tie that should never occur.
+detect_mode() {
+  local dir="$1"
+  [ -f "${dir}/terraform.tfstate" ] || return 1
+  [ "$(jq -r '.resources | length' "${dir}/terraform.tfstate" 2>/dev/null || echo 0)" != "0" ]
+}
+
+if detect_mode 04-worker; then
+  PROCESSING_MODE="vm"
+elif detect_mode 04-sch; then
+  PROCESSING_MODE="sch"
+else
+  PROCESSING_MODE="${PROCESSING_MODE:-sch}"
+fi
+
+echo "NOTE: Processing mode - ${PROCESSING_MODE}"
 
 worker_ip=""
 if [ "${PROCESSING_MODE}" = "vm" ] && [ -d 04-worker ]; then

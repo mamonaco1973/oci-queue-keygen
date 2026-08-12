@@ -17,16 +17,22 @@ polls a result endpoint until the keys are ready.
 > "queue"/"streaming"; the default design is **Queue + VM**.
 >
 > **Both paths now ship.** `PROCESSING_MODE=vm|sch` selects Phase 4, so the
-> latency claim is measured rather than asserted.
+> latency claim is measured rather than asserted. **Measured 2026-08-12:**
+> `vm` sub-second; `sch` with `batch_size_in_num=1` **1–2s**; `sch` with a
+> KB-based size threshold **~30s**.
 >
-> **60s is an API-enforced floor on `target.batchTimeInSec`, not a default.**
-> Confirmed 2026-08-12: `batch_time_in_sec = 5` is rejected at create time with
-> `400-InvalidParameter, target.batchTimeInSec must be greater than or equal to
-> 60`. Oracle's queue-to-function doc shows a 5s example — it does not apply to
-> this target. So the original "~30s observed" figure is correct and defensible:
-> uniform arrival in a 60s window averages half the window. `batch_size_in_num`
-> is the only remaining latency lever, and whether size=1 short-circuits the
-> time window is an open empirical question this mode exists to answer.
+> **The ~30s was a configuration artifact, not a service limit.** Connector Hub
+> flushes on whichever threshold hits first; a one-message size threshold fills
+> instantly so the timer never expires. A KB threshold never fills for
+> few-hundred-byte messages, so the time limit governs and requests wait ~half
+> of it. Do not repeat the old "SCH is unusably slow" claim — it was wrong.
+>
+> 60s remains an API-enforced floor on `target.batchTimeInSec` (5 is rejected;
+> Oracle's queue-to-function doc shows a 5s example that this target refuses),
+> but with `batch_size_in_num=1` that floor is inert.
+>
+> The VM's remaining edge is sub-second vs 1–2s, plus an always-free shape —
+> a preference, not a necessity.
 
 ---
 
@@ -46,31 +52,45 @@ Keys are base64-encoded and expire from NoSQL after 1 day (table TTL).
 
 ## Architecture
 
+Default mode (`sch`):
+
 ```
 Browser / curl
      │
      ▼
 OCI API Gateway — keygen-gateway (PUBLIC)
      ├── POST /keygen      → Function: keygen-post ──put──► OCI Queue (keygen-requests)
-     │                                                              │ long-poll
+     │                                                              │ batch read
+     │                                                              │ (batch_size_in_num=1)
      │                                                              ▼
-     │                                              Worker VM: keygen-worker
-     │                                              systemd: consumer.py
-     │                                              (instance principal auth)
+     │                                              Connector Hub (QueueSource)
+     │                                                              │ invoke
+     │                                                              ▼
+     │                                              Function: keygen-worker-fn
+     │                                              (resource principal auth)
      │                                                              │
      │                                                              ▼
      └── GET /result/{id}  → Function: keygen-get ◄──read──  OCI NoSQL (keygen_results)
          GET /heartbeat    → Function: keygen-get (X-Heartbeat → fast 200)
 ```
 
-**One image, three handlers:** `keygen-post`, `keygen-get` and (in `sch` mode)
-`keygen-worker-fn` all share a single OCIR image; `FUNCTION_TYPE` routes the FDK
-`handler()`. In the default `vm` mode the worker is NOT a function — it's
+Alternative mode (`vm`) replaces the middle two stages with:
+
+```
+OCI Queue ──long-poll──► Worker VM: keygen-worker
+                         systemd: consumer.py
+                         (instance principal auth) ──write──► OCI NoSQL
+```
+
+**One image, three handlers:** `keygen-post`, `keygen-get` and (in the default
+`sch` mode) `keygen-worker-fn` all share a single OCIR image; `FUNCTION_TYPE`
+routes the FDK `handler()`. In `vm` mode the worker is NOT a function — it's
 `consumer.py` running under systemd on a micro-VM.
 
-**Async trigger:** none exists on OCI. In `vm` mode the worker long-polls the
-Queue (`GetMessages` with a 30s wait), so latency is near-zero in steady state.
-In `sch` mode Connector Hub batches instead — see the mode notes below.
+**Async trigger:** no true event-source mapping exists on OCI. `sch` mode uses
+Connector Hub with `batch_size_in_num=1`, which flushes on the first message and
+lands at 1–2s. `vm` mode long-polls the Queue (`GetMessages`, 30s wait) and is
+sub-second — faster, but it is a server you own.
 
 **`cryptography` is imported lazily** inside the worker handler, not at module
 scope, so post/get cold start is unchanged by its presence in the image. Do not
@@ -114,7 +134,7 @@ The `/heartbeat` route injects `X-Heartbeat` so the get function returns early.
   iam.tf         Dynamic Group + policies (functions→NoSQL+Queue, API GW→functions)
   logging.tf     Functions Application invoke logs
   outputs.tf     api_gateway_endpoint, nosql_table_name, ocir_image_path
-04-worker/       Phase 4 when PROCESSING_MODE=vm (default)
+04-worker/       Phase 4 when PROCESSING_MODE=vm
   main.tf            provider (oci/tls/local), variables
   network.tf         self-contained VCN + public subnet (SSH + egress)
   compute.tf         Ubuntu micro-VM + generated SSH key + cloud-init
@@ -122,7 +142,7 @@ The `/heartbeat` route injects `X-Heartbeat` so the get function returns early.
   consumer.py        long-polling Queue consumer (instance principal auth)
   iam.tf             Dynamic Group (by instance OCID) + Queue/NoSQL policy
   outputs.tf         worker_public_ip, worker_ssh_command
-04-sch/          Phase 4 when PROCESSING_MODE=sch — the serverless alternative
+04-sch/          Phase 4 when PROCESSING_MODE=sch (DEFAULT) — the managed path
   main.tf            provider, variables, batch tuning (batch_time_in_sec etc.)
   functions.tf       keygen-worker-fn in the 03-functions application
   sch.tf             Connector Hub: QueueSource plugin → functions target
@@ -144,10 +164,10 @@ validate.sh    End-to-end smoke test via curl (POST then poll)
 ## Deployment
 
 ```bash
-./apply.sh                        # full deploy, mode vm (default)
-PROCESSING_MODE=sch ./apply.sh    # full deploy, mode sch
+./apply.sh                        # full deploy, mode sch (DEFAULT)
+PROCESSING_MODE=vm ./apply.sh     # full deploy, mode vm
 ./destroy.sh                      # teardown (tears down BOTH phase-4 dirs)
-./validate.sh                     # smoke test only (after deploy)
+./validate.sh                     # smoke test only (detects mode from state)
 ```
 
 Modes are mutually exclusive — both consume the same queue, so `apply.sh` aborts

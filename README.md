@@ -2,7 +2,7 @@
 
 This project delivers an automated **asynchronous SSH key generation service**
 on OCI, powered by **OCI Queue**, **OCI Functions**, **OCI NoSQL Database**,
-**API Gateway**, and a lightweight **queue-consumer VM**.
+**API Gateway**, and **Connector Hub**.
 
 It uses **Terraform**, **Docker**, and **Python (OCI SDK + cryptography)** to
 build a **message-driven key generation pipeline** that asynchronously processes
@@ -10,78 +10,80 @@ SSH keypair requests and stores completed results in NoSQL.
 
 This is the OCI port of [`aws-sqs-keygen`](https://github.com/mamonaco1973/aws-sqs-keygen).
 
-## Why a VM consumer instead of a serverless trigger?
+## There is no SQS→Lambda on OCI. There is something close.
 
 The AWS original relies on an **SQS→Lambda event-source mapping**: a message on
 the queue automatically invokes the worker in milliseconds. **OCI has no
-first-class equivalent.** Two facts drove this design:
+first-class equivalent** — Queue has no native compute trigger, so nothing
+auto-invokes a Function the way SQS does.
 
-- **OCI Queue has no native compute trigger** — you must provide a consumer, or
-  bridge it with an intermediary. There's no Functions config that auto-consumes
-  the queue and invokes a worker the way SQS→Lambda does.
-- **Service Connector Hub** *can* bridge Queue→Functions, but it's a
-  batching/data-movement service, not a low-latency event-source mapping. Its
-  batch time is configurable, yet in our testing we consistently observed **~30s
-  or more** between enqueue and invocation — unacceptable for on-demand keygen.
-  (Queue only became a valid Connector Hub source in Feb 2024.)
+What OCI gives you instead is **Connector Hub**: a batching data-movement
+service you point at the queue and aim at a Function. You configure thresholds,
+not a trigger. It is *not* an event-source mapping — but configured correctly it
+is close enough that the distinction stops mattering for this workload.
 
-The fix that's both fast **and** cheap: keep `post`/`get` as serverless
-Functions, and run the worker as a **long-polling consumer on a micro-VM**. OCI
-Queue supports polling waits up to 30s that return the instant a message appears,
-so processing is near-instant without hammering the Queue API.
+"Configured correctly" is doing real work in that sentence:
 
-### Don't take our word for it — deploy both
+| Phase 4 mode | Configuration | End-to-end |
+|---|---|---|
+| `sch` *(default)* | `batch_size_in_num = 1` | **1–2s** |
+| `sch` | size threshold in KB | **~30s** |
+| `vm` | 30s long poll | **sub-second** |
 
-`PROCESSING_MODE` selects which Phase 4 gets deployed, so the claim above is
-measurable rather than asserted:
+**Connector Hub flushes on whichever threshold is hit first.** Set the batch
+size to one message and the batch is full the instant a message is read, so the
+batch *timer* never expires. Leave the size threshold in kilobytes — the obvious
+choice, since these messages are a few hundred bytes — and it never fills, so
+the time limit governs every flush and a request waits ~half of it.
+
+That single dropdown is the difference between a 1-second API and a 30-second
+one, and nothing in the setup flow points at it. It is the most important thing
+in this repository.
+
+`batch_time_in_sec` has an API-enforced floor of 60 (asking for 5 is rejected
+outright, despite Oracle's [queue-to-function
+doc](https://docs.oracle.com/en-us/iaas/Content/connector-hub/queue-to-function.htm)
+showing a 5-second example) — but with `batch_size_in_num = 1` that floor never
+binds.
+
+### The VM alternative
+
+Before the batch-size finding, this project ran the worker as a **long-polling
+consumer daemon on a micro-VM** — OCI Queue supports polling waits up to 30s
+that return the instant a message appears, which is genuinely sub-second and
+costs nothing on an always-free shape.
+
+That mode still ships (`PROCESSING_MODE=vm`) and is still the fastest option.
+It is no longer the *default*, because trading 1s for sub-second is rarely worth
+owning, patching, and monitoring a server. Deploy it when latency actually
+matters, or to reproduce the comparison yourself:
 
 ```bash
-PROCESSING_MODE=vm  ./apply.sh   # default: long-polling consumer on a micro-VM
-PROCESSING_MODE=sch ./apply.sh   # Connector Hub batching Queue → worker Function
+./apply.sh                        # default: sch — Connector Hub + worker Function
+PROCESSING_MODE=vm ./apply.sh     # long-polling consumer on a micro-VM
 ```
 
 Both modes serve the identical API and web client. The web client logs
-millisecond timings to the **browser console** (`[timing] …`) and shows the
-elapsed time on the page, so you can compare the two end to end from the same UI.
+millisecond timings to the **browser console** (`[timing] …`) and shows elapsed
+time on the page, so the comparison is reproducible from the same UI.
 
 The modes are mutually exclusive — they consume the same queue, so `apply.sh`
 refuses to deploy one while the other is up. Run `./destroy.sh` (which tears
 down whichever is deployed) before switching.
 
-`04-sch` runs at the most aggressive settings Connector Hub allows:
-`batch_size_in_num=1` and `batch_time_in_sec=60`. The 60 is not a choice — it's
-an API-enforced floor, and asking for less is rejected outright:
-
-```
-400-InvalidParameter, target.batchTimeInSec must be greater than or equal to 60
-```
-
-(Oracle's own [queue-to-function
-doc](https://docs.oracle.com/en-us/iaas/Content/connector-hub/queue-to-function.htm)
-shows a 5-second batch time example. It is not accepted for this target.)
-
-That floor *is* the finding. A request arriving at a random point inside a 60s
-window waits ~30s on average before compute even starts — which is why the
-default mode long-polls from a VM instead.
-
-> **The real substitution:** the VM isn't here because keygen *needs* a VM — it's
-> implementing the piece of Lambda's control plane (the event-source mapping)
-> that OCI Functions doesn't provide. AWS gives you a *managed* consumer; on OCI
-> you bring your own.
-
-> **Cost footnote:** `VM.Standard.E2.1.Micro` is Always Free eligible (up to two
-> instances), so the demo worker is effectively $0. Note that Oracle may reclaim
+> **Cost footnote (vm mode):** `VM.Standard.E2.1.Micro` is Always Free eligible
+> (up to two instances), so the worker is effectively $0. Oracle may reclaim
 > Always Free compute that stays below its utilization thresholds over a 7-day
 > window — a consumer blocked in long-poll can look idle — so treat the free
-> shape as an excellent demo/zero-cost option, with a small paid shape
+> shape as an excellent demo option, with a small paid shape
 > (`export TF_VAR_instance_shape=...`) as the production fallback.
 
 | AWS building block | OCI equivalent used here |
 |--------------------|--------------------------|
 | SQS queue | OCI Queue |
-| SQS→Lambda event-source mapping | Long-polling consumer on a micro-VM |
-| Lambda (post / get) | OCI Functions (one image, two functions) |
-| Lambda (worker) | systemd consumer daemon on the VM |
+| SQS→Lambda event-source mapping | Connector Hub (batch size 1) — or a VM consumer |
+| Lambda (post / get) | OCI Functions (one image, shared handlers) |
+| Lambda (worker) | OCI Function (`sch`) / systemd daemon on a VM (`vm`) |
 | Amazon ECR | OCI Container Registry (OCIR) |
 | DynamoDB (+ TTL) | OCI NoSQL Database (row TTL) |
 | API Gateway (HTTP API) | OCI API Gateway |
@@ -94,8 +96,12 @@ default mode long-polls from a VM instead.
 
 1. **POST `/keygen`** — the post function generates a `request_id` (UUID4),
    puts the request on the Queue, and returns **202 Accepted** immediately.
-2. **Worker VM** long-polls the Queue, generates the keypair (`cryptography`),
-   writes it to NoSQL, and deletes (acks) the message.
+2. **Connector Hub** reads the message (batch size 1, so it flushes at once) and
+   invokes the **worker function**, which generates the keypair
+   (`cryptography`) and writes it to NoSQL. Connector Hub owns the read/delete
+   cycle — the function never acks.
+   *In `vm` mode this stage is instead a micro-VM long-polling the Queue, which
+   generates the keypair and deletes (acks) the message itself.*
 3. **GET `/result/{id}`** — returns **202** while pending and **200** with the
    base64-encoded keypair once the worker has stored it.
 
@@ -135,13 +141,14 @@ Returns `{ "request_id": "…", "status": "queued" }`.
 - `oci`, `terraform`, `docker`, `jq`, `envsubst` in your PATH
 - OCI CLI configured (`~/.oci/config` with an API key)
 - Docker daemon running (local image build)
-- Capacity for one always-free (or small) compute instance in your tenancy
+- For `PROCESSING_MODE=vm` only: capacity for one always-free (or small)
+  compute instance in your tenancy
 
 ## Deploy / Destroy / Validate
 
 ```bash
-./apply.sh      # 5-phase deploy, then a smoke test
-./destroy.sh    # tear everything down (reverse order)
+./apply.sh      # 5-phase deploy (mode sch), then a smoke test
+./destroy.sh    # tear everything down (reverse order, both modes)
 ./validate.sh   # smoke test only, after a deploy
 ```
 
@@ -152,12 +159,15 @@ Optional: `export OCI_COMPARTMENT_ID=ocid1.compartment...` (defaults to tenancy 
 1. **01-queue** — OCIR repository + OCI Queue
 2. **02-docker** — build the functions image, push to OCIR
 3. **03-functions** — Functions (post/get), NoSQL, VCN, API Gateway, IAM
-4. **04-worker** *(mode `vm`)* — the queue-consumer VM (cloud-init installs +
-   starts the daemon), **or** **04-sch** *(mode `sch`)* — Connector Hub +
-   worker Function
+4. **04-sch** *(default)* — Connector Hub + worker Function, **or**
+   **04-worker** *(mode `vm`)* — the queue-consumer VM (cloud-init installs +
+   starts the daemon)
 5. **05-webapp** — inject the API URL into the HTML, deploy to Object Storage
 
-## The worker VM
+`validate.sh` detects the deployed mode from Terraform state, so it works
+standalone regardless of which mode is up.
+
+## The worker VM (mode `vm`)
 
 `04-worker` provisions a micro-VM (default `VM.Standard.E2.1.Micro`, an
 always-free shape) that runs [`consumer.py`](04-worker/consumer.py) as a systemd

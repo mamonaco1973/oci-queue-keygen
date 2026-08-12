@@ -73,24 +73,28 @@ variable "nosql_table_name" {
 # ------------------------------------------------------------------------------
 # Batch tuning — the whole point of this mode
 # ------------------------------------------------------------------------------
-# 60s is a HARD FLOOR enforced by the API, not a soft default.  Setting 5 here
-# is rejected at create time:
+# MEASURED 2026-08-12, and it contradicts the obvious reading of the docs:
 #
-#   400-InvalidParameter, target.batchTimeInSec must be greater than or equal
-#   to 60
+#   batch_size_in_num = 1,  batch_time_in_sec = 60  ->  1-2s end to end
+#   a KB-based size threshold, batch_time_in_sec = 60 ->  ~30s end to end
 #
-# (Oracle's own queue-to-function doc shows a 5-second example.  It is wrong for
-# this target.)  This is the measurement: a request arriving at a uniformly
-# random point in a 60s window waits ~30s on average before compute even starts,
-# which is why the VM long-poll exists.
+# Connector Hub flushes on whichever threshold is reached FIRST.  With a size
+# threshold of one message the batch is full the moment a message is read, so
+# the timer never expires and batch_time_in_sec is effectively inert.  The
+# residual 1-2s is the connector's own source-read interval plus the function
+# invoke — not the batch window.
 #
-# batch_size_in_num is therefore the only latency lever left.  Whether a size
-# threshold of 1 short-circuits the time window — or the connector still waits
-# out the full 60s — is exactly what deploying this mode measures.
+# This is why the ~30s originally observed here was a configuration artifact,
+# not a service limit: a few-hundred-byte message never fills a KB-sized batch,
+# so the time limit governed every flush and requests waited ~half of it.
+#
+# 60 remains an API-enforced floor on batch_time_in_sec (5 is rejected outright,
+# despite Oracle's queue-to-function doc showing a 5-second example), but with
+# batch_size_in_num = 1 that floor almost never binds.
 # ------------------------------------------------------------------------------
 
 variable "batch_time_in_sec" {
-  description = "Connector Hub batch rollover time; API floor is 60s"
+  description = "Batch rollover time; API floor is 60s, inert when size is 1"
   type        = number
   default     = 60
 
@@ -101,8 +105,11 @@ variable "batch_time_in_sec" {
   }
 }
 
+# THE setting that determines latency.  Raising it trades responsiveness for
+# fewer function invocations; leaving it unset (so a KB threshold governs) is
+# what makes the service look 30x slower than it is.
 variable "batch_size_in_num" {
-  description = "Messages per batch; 1 is the lowest-latency setting available"
+  description = "Messages per batch; 1 flushes immediately and dominates latency"
   type        = number
   default     = 1
 }
