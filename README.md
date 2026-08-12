@@ -48,10 +48,21 @@ The modes are mutually exclusive — they consume the same queue, so `apply.sh`
 refuses to deploy one while the other is up. Run `./destroy.sh` (which tears
 down whichever is deployed) before switching.
 
-`04-sch` defaults to the **most aggressive** batch settings Connector Hub
-accepts (`batch_time_in_sec=5`, `batch_size_in_num=1`), not the service defaults
-— comparing against a 60s default batch window would be stacking the deck. Set
-`TF_VAR_batch_time_in_sec=60` to see out-of-the-box behaviour.
+`04-sch` runs at the most aggressive settings Connector Hub allows:
+`batch_size_in_num=1` and `batch_time_in_sec=60`. The 60 is not a choice — it's
+an API-enforced floor, and asking for less is rejected outright:
+
+```
+400-InvalidParameter, target.batchTimeInSec must be greater than or equal to 60
+```
+
+(Oracle's own [queue-to-function
+doc](https://docs.oracle.com/en-us/iaas/Content/connector-hub/queue-to-function.htm)
+shows a 5-second batch time example. It is not accepted for this target.)
+
+That floor *is* the finding. A request arriving at a random point inside a 60s
+window waits ~30s on average before compute even starts — which is why the
+default mode long-polls from a VM instead.
 
 > **The real substitution:** the VM isn't here because keygen *needs* a VM — it's
 > implementing the piece of Lambda's control plane (the event-source mapping)

@@ -73,22 +73,36 @@ variable "nosql_table_name" {
 # ------------------------------------------------------------------------------
 # Batch tuning — the whole point of this mode
 # ------------------------------------------------------------------------------
-# Defaults are deliberately set to the most aggressive (lowest-latency) values
-# Connector Hub accepts, NOT the service defaults.  The service default batch
-# time is 60s, which makes a request/response workload look far worse than the
-# service is capable of; measuring at the floor keeps the comparison fair.
+# 60s is a HARD FLOOR enforced by the API, not a soft default.  Setting 5 here
+# is rejected at create time:
 #
-# Raise batch_time_in_sec to 60 to reproduce out-of-the-box behaviour.
+#   400-InvalidParameter, target.batchTimeInSec must be greater than or equal
+#   to 60
+#
+# (Oracle's own queue-to-function doc shows a 5-second example.  It is wrong for
+# this target.)  This is the measurement: a request arriving at a uniformly
+# random point in a 60s window waits ~30s on average before compute even starts,
+# which is why the VM long-poll exists.
+#
+# batch_size_in_num is therefore the only latency lever left.  Whether a size
+# threshold of 1 short-circuits the time window — or the connector still waits
+# out the full 60s — is exactly what deploying this mode measures.
 # ------------------------------------------------------------------------------
 
 variable "batch_time_in_sec" {
-  description = "Connector Hub batch rollover time — lower is faster, floor varies"
+  description = "Connector Hub batch rollover time; API floor is 60s"
   type        = number
-  default     = 5
+  default     = 60
+
+  # Fail in plan rather than after a round trip to the create API.
+  validation {
+    condition     = var.batch_time_in_sec >= 60
+    error_message = "Connector Hub rejects target.batchTimeInSec below 60."
+  }
 }
 
 variable "batch_size_in_num" {
-  description = "Messages per batch; 1 flushes as soon as a message is read"
+  description = "Messages per batch; 1 is the lowest-latency setting available"
   type        = number
   default     = 1
 }

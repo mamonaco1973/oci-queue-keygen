@@ -17,13 +17,16 @@ polls a result endpoint until the keys are ready.
 > "queue"/"streaming"; the default design is **Queue + VM**.
 >
 > **Both paths now ship.** `PROCESSING_MODE=vm|sch` selects Phase 4, so the
-> latency claim is measured rather than asserted. Do NOT quote a fixed SCH
-> number in docs: the earlier "~30s" figure was observed at the service's 60s
-> **default** batch time (a request waits on average half the window), and the
-> batch time is tunable — `04-sch` defaults to the aggressive end (5s / 1
-> message) precisely so the comparison isn't rigged. The durable claim is
-> structural: batching cannot beat long-polling for request/response, and you
-> pay per connector run either way.
+> latency claim is measured rather than asserted.
+>
+> **60s is an API-enforced floor on `target.batchTimeInSec`, not a default.**
+> Confirmed 2026-08-12: `batch_time_in_sec = 5` is rejected at create time with
+> `400-InvalidParameter, target.batchTimeInSec must be greater than or equal to
+> 60`. Oracle's queue-to-function doc shows a 5s example — it does not apply to
+> this target. So the original "~30s observed" figure is correct and defensible:
+> uniform arrival in a 60s window averages half the window. `batch_size_in_num`
+> is the only remaining latency lever, and whether size=1 short-circuits the
+> time window is an open empirical question this mode exists to answer.
 
 ---
 

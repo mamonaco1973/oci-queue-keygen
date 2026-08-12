@@ -31,8 +31,9 @@ resource "oci_sch_service_connector" "keygen" {
   # ----------------------------------------------------------------------------
   # Only one of batch_size_in_kbs / batch_size_in_num may be set; messages here
   # are a few hundred bytes, so a size threshold in KB would never trigger and
-  # the time limit would govern every flush.  Counting messages is what makes a
-  # low-latency configuration possible at all.
+  # the 60s time limit would govern every flush.  Counting messages is the only
+  # remaining way to ask for a faster flush — batch_time_in_sec cannot go below
+  # 60 (see main.tf).
   # ----------------------------------------------------------------------------
   target {
     kind              = "functions"
