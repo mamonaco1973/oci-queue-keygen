@@ -125,23 +125,37 @@ req_payload="$(jq -n \
 
 echo "NOTE: Sending request - key_type=${KEY_TYPE}, key_bits=${KEY_BITS}"
 
+# apply.sh calls this within seconds of creating the API Gateway, and a brand
+# new gateway hostname takes a few minutes to resolve — the first POST reliably
+# fails with curl 6 (DNS) on a cold deploy.  So retry rather than fail: the
+# endpoint is coming, it just is not in DNS yet.
+#
 # -sS not -s: plain -s silences curl's own error text as well as the progress
-# meter, so under `set -e` a connection-level failure killed this script with no
-# message and no exit code — it just stopped after the line above.  Capture the
-# status explicitly and report it instead of dying mute.
-set +e
-response="$(curl -sS --max-time 30 -X POST "${api_url}/keygen" \
-  -H "Content-Type: application/json" \
-  -d "${req_payload}" 2>&1)"
-curl_rc=$?
-set -e
+# meter, so under `set -e` a connection failure killed this script with no
+# message and no exit code — it simply stopped after the line above.
+SUBMIT_ATTEMPTS=20
+SUBMIT_INTERVAL=15      # 20 x 15s = up to 5 minutes for DNS to catch up
 
-if [[ ${curl_rc} -ne 0 ]]; then
-  echo "ERROR: POST ${api_url}/keygen failed (curl exit ${curl_rc})."
-  echo "NOTE: ${response}"
-  echo "NOTE: 6=DNS  7=connect refused  28=timeout  35/60=TLS."
-  exit 1
-fi
+for ((s=1; s<=SUBMIT_ATTEMPTS; s++)); do
+  set +e
+  response="$(curl -sS --max-time 30 -X POST "${api_url}/keygen" \
+    -H "Content-Type: application/json" \
+    -d "${req_payload}" 2>&1)"
+  curl_rc=$?
+  set -e
+
+  [[ ${curl_rc} -eq 0 ]] && break
+
+  if [[ ${s} -eq ${SUBMIT_ATTEMPTS} ]]; then
+    echo "ERROR: POST ${api_url}/keygen failed (curl exit ${curl_rc})."
+    echo "NOTE: ${response}"
+    echo "NOTE: 6=DNS  7=connect refused  28=timeout  35/60=TLS."
+    exit 1
+  fi
+
+  echo "NOTE: Endpoint not reachable yet (${s}/${SUBMIT_ATTEMPTS}, curl ${curl_rc}) — waiting ${SUBMIT_INTERVAL}s..."
+  sleep "${SUBMIT_INTERVAL}"
+done
 
 request_id="$(echo "${response}" | jq -r '.request_id // empty')"
 
