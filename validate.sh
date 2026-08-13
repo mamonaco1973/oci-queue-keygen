@@ -125,9 +125,23 @@ req_payload="$(jq -n \
 
 echo "NOTE: Sending request - key_type=${KEY_TYPE}, key_bits=${KEY_BITS}"
 
-response="$(curl -s -X POST "${api_url}/keygen" \
+# -sS not -s: plain -s silences curl's own error text as well as the progress
+# meter, so under `set -e` a connection-level failure killed this script with no
+# message and no exit code — it just stopped after the line above.  Capture the
+# status explicitly and report it instead of dying mute.
+set +e
+response="$(curl -sS --max-time 30 -X POST "${api_url}/keygen" \
   -H "Content-Type: application/json" \
-  -d "${req_payload}")"
+  -d "${req_payload}" 2>&1)"
+curl_rc=$?
+set -e
+
+if [[ ${curl_rc} -ne 0 ]]; then
+  echo "ERROR: POST ${api_url}/keygen failed (curl exit ${curl_rc})."
+  echo "NOTE: ${response}"
+  echo "NOTE: 6=DNS  7=connect refused  28=timeout  35/60=TLS."
+  exit 1
+fi
 
 request_id="$(echo "${response}" | jq -r '.request_id // empty')"
 
@@ -147,8 +161,10 @@ MAX_ATTEMPTS=60
 SLEEP_SECONDS=5
 
 for ((i=1; i<=MAX_ATTEMPTS; i++)); do
-  result="$(curl -s "${api_url}/result/${request_id}")"
-  status="$(echo "${result}" | jq -r '.status // empty')"
+  # A transient poll failure should retry, not abort the run, so the exit code
+  # is swallowed deliberately here — the MAX_ATTEMPTS ceiling is the backstop.
+  result="$(curl -sS --max-time 30 "${api_url}/result/${request_id}" 2>&1 || true)"
+  status="$(echo "${result}" | jq -r '.status // empty' 2>/dev/null || echo "")"
 
   if [[ "${status}" == "complete" ]]; then
     echo "NOTE: Key generation complete."
