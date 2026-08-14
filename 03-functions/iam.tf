@@ -7,17 +7,16 @@
 #    The Functions runtime must pull images from OCIR and attach containers to
 #    the VCN subnet, or functions fail to cold-start (502).
 #
-# 2. Functions → NoSQL + Queue
-#    A Dynamic Group matches all Functions in the compartment.  Policies let the
-#    get function read NoSQL and the post function publish to the Queue.
-#    The Resource Principal signer in func.py relies on these.
-#
-# 3. API Gateway → Functions
+# 2. API Gateway → Functions
 #    Service-principal policy allowing API Gateway to invoke the functions.
 #
+# Both are SERVICE principals, so neither depends on dynamic-group membership
+# and neither is subject to the token-caching race that moved the Functions
+# dynamic group into 01-queue/iam.tf (see the note below).
+#
 # The worker VM's own dynamic group + policies live in 04-worker/iam.tf.
-# Dynamic groups and tenancy-scoped policies are created in the root
-# compartment (var.tenancy_ocid), not a child compartment.
+# Tenancy-scoped policies are created in the root compartment
+# (var.tenancy_ocid), not a child compartment.
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
@@ -35,34 +34,14 @@ resource "oci_identity_policy" "faas_infra" {
 }
 
 # ------------------------------------------------------------------------------
-# Dynamic Group — matches all Functions in the compartment
+# Moved out: Dynamic Group + Functions data policy
 # ------------------------------------------------------------------------------
-resource "oci_identity_dynamic_group" "keygen_functions" {
-  compartment_id = var.tenancy_ocid # Dynamic groups live at the tenancy root
-  name           = "keygen-functions-dg"
-  description    = "OCI Functions in the keygen compartment (Resource Principal auth)"
-
-  # ALL{} syntax required for Identity Domain-enabled tenancies (IDCS backend).
-  matching_rule = "ALL {resource.type = 'fnfunc', resource.compartment.id = '${var.compartment_id}'}"
-}
-
+# `keygen-functions-dg` and `keygen-functions-data` now live in 01-queue/iam.tf.
+# A Resource Principal token caches its dynamic-group membership when the
+# container starts, so a DG created here — in the same phase as the Functions —
+# could lose the race and strand the first container with a groupless token.
+# Creating it a phase earlier gives it the rest of the build to propagate.
 # ------------------------------------------------------------------------------
-# Policy — Functions can read NoSQL and publish to the Queue
-# ------------------------------------------------------------------------------
-# get reads NoSQL rows; post puts messages on the queue.  `use queues` covers
-# QUEUE_PUT; the consume/delete side is the VM consumer's grant (see 04-worker).
-# ------------------------------------------------------------------------------
-resource "oci_identity_policy" "functions_data" {
-  compartment_id = var.tenancy_ocid
-  name           = "keygen-functions-data"
-  description    = "Allow keygen functions to read NoSQL and publish to the Queue"
-
-  statements = [
-    "Allow dynamic-group keygen-functions-dg to manage nosql-rows in compartment id ${var.compartment_id}",
-    "Allow dynamic-group keygen-functions-dg to use nosql-tables in compartment id ${var.compartment_id}",
-    "Allow dynamic-group keygen-functions-dg to use queues in compartment id ${var.compartment_id}",
-  ]
-}
 
 # ------------------------------------------------------------------------------
 # Policy — API Gateway can invoke Functions

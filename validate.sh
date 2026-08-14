@@ -144,8 +144,40 @@ echo "NOTE: Sending request - key_type=${KEY_TYPE}, key_bits=${KEY_BITS}"
 # message and no exit code — it simply stopped after the line above.
 SUBMIT_ATTEMPTS=20
 SUBMIT_INTERVAL=15      # 20 x 15s = up to 5 minutes for the deploy to settle
+RECYCLE_AFTER=3         # attempts to allow before assuming a stale token
+
+# ------------------------------------------------------------------------------
+# recycle_post_fn — force keygen-post onto a fresh container
+# ------------------------------------------------------------------------------
+# A Function's Resource Principal token caches its dynamic-group membership at
+# the moment the container starts.  On a fresh deploy the first container can
+# boot before the DG has propagated, and it then carries a token that belongs
+# to no group -- every queue put returns 404 NotAuthorizedOrNotFound, forever,
+# because the container stays warm.  Waiting cannot fix it and neither can
+# adding policy; only a new container gets a new token.  Updating any function
+# attribute recycles containers, so memory is toggled and put straight back so
+# Terraform state stays clean.
+# ------------------------------------------------------------------------------
+recycle_post_fn() {
+  local app_id fn_id mem alt
+  app_id="$( (cd 03-functions && terraform output -raw functions_application_id) 2>/dev/null )" || return 0
+  [ -z "${app_id}" ] && return 0
+
+  fn_id="$(oci fn function list --application-id "${app_id}" --all \
+    --query "data[?\"display-name\"=='keygen-post'] | [0].id" --raw-output 2>/dev/null)" || return 0
+  [ -z "${fn_id}" ] || [ "${fn_id}" = "null" ] && return 0
+
+  mem="$(oci fn function get --function-id "${fn_id}" \
+    --query 'data."memory-in-mbs"' --raw-output 2>/dev/null)" || return 0
+  [ "${mem}" = "256" ] && alt=512 || alt=256
+
+  echo "NOTE: Recycling keygen-post to refresh its Resource Principal token..."
+  oci fn function update --function-id "${fn_id}" --memory-in-mbs "${alt}" >/dev/null 2>&1 || true
+  oci fn function update --function-id "${fn_id}" --memory-in-mbs "${mem}" >/dev/null 2>&1 || true
+}
 
 request_id=""
+recycled=0
 
 for ((s=1; s<=SUBMIT_ATTEMPTS; s++)); do
   set +e
@@ -165,6 +197,13 @@ for ((s=1; s<=SUBMIT_ATTEMPTS; s++)); do
     [[ -z "${reason}" ]] && reason="${response}"
   else
     reason="endpoint not reachable (curl ${curl_rc})"
+  fi
+
+  # The gateway answered but the function failed: that is the stale-token
+  # signature, and no amount of further waiting clears it.  Recycle once.
+  if [[ ${curl_rc} -eq 0 && ${recycled} -eq 0 && ${s} -ge ${RECYCLE_AFTER} ]]; then
+    recycle_post_fn
+    recycled=1
   fi
 
   if [[ ${s} -eq ${SUBMIT_ATTEMPTS} ]]; then

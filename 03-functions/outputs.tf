@@ -21,7 +21,8 @@ output "ocir_image_path" {
 }
 
 # Consumed by 04-sch, which adds the worker function to this same application
-# so it inherits the VCN subnet and the keygen-functions-dg grants.
+# so it inherits the VCN subnet, and the keygen-functions-dg grants from
+# 01-queue apply to it by compartment.
 output "functions_application_id" {
   description = "OCID of the Functions Application hosting the keygen functions"
   value       = oci_functions_application.keygen.id

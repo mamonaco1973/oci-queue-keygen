@@ -6,7 +6,7 @@
 # created by 03-functions so it shares that VCN subnet and log configuration.
 #
 # NoSQL access needs no policy here: this function matches the
-# keygen-functions-dg dynamic group from 03-functions, which already grants
+# keygen-functions-dg dynamic group from 01-queue, which already grants
 # manage nosql-rows across the compartment.
 # ==============================================================================
 

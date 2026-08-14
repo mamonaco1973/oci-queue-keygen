@@ -5,9 +5,14 @@
 # Purpose:
 #   Orchestrates end-to-end deployment of the async SSH KeyGen service on OCI.
 #
-#   Phase 1 (01-queue):     Creates OCIR repository + OCI Queue
+#   Phase 1 (01-queue):     Creates OCIR repository, OCI Queue, and the
+#                           Functions dynamic group + data policy — created
+#                           first on purpose, so the group has propagated
+#                           before any Function container starts and caches
+#                           its Resource Principal token (see 01-queue/iam.tf)
 #   Phase 2 (02-docker):    Builds the functions image and pushes it to OCIR
-#   Phase 3 (03-functions): Deploys Functions (post/get), NoSQL, VCN, IAM, API GW
+#   Phase 3 (03-functions): Deploys Functions (post/get), NoSQL, VCN, API GW,
+#                           plus the faas + API Gateway service policies
 #   Phase 4:                Deploys the queue processor — see PROCESSING_MODE
 #   Phase 5 (05-webapp):    Injects API URL into HTML and deploys to Object Storage
 #
