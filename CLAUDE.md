@@ -17,15 +17,19 @@ polls a result endpoint until the keys are ready.
 > "queue"/"streaming"; the default design is **Queue + VM**.
 >
 > **Both paths now ship.** `PROCESSING_MODE=vm|sch` selects Phase 4, so the
-> latency claim is measured rather than asserted. **Measured 2026-08-12:**
-> `vm` sub-second; `sch` with `batch_size_in_num=1` **1–2s**; `sch` with a
-> KB-based size threshold **~30s**.
+> latency claim is measured rather than asserted. **Measured:** `vm`
+> sub-second; `sch` with `batch_size_in_num=1` **0.8–2s**; `sch` at the service
+> default of 100 messages **61.54s** (2026-08-13, warm worker).
 >
-> **The ~30s was a configuration artifact, not a service limit.** Connector Hub
-> flushes on whichever threshold hits first; a one-message size threshold fills
-> instantly so the timer never expires. A KB threshold never fills for
-> few-hundred-byte messages, so the time limit governs and requests wait ~half
-> of it. Do not repeat the old "SCH is unusably slow" claim — it was wrong.
+> **The batch timer starts when the first message of a batch arrives** — it is
+> not a fixed cadence. So a lone message opens the window and waits the entire
+> 60s; it does NOT average half. An earlier version of these notes claimed the
+> half-window average and it was wrong, disproven by repeated runs all landing
+> at ~61s. The cost is flat on every request.
+>
+> A one-message size threshold fills the batch on arrival, so it flushes at once
+> and the timer never applies. Do not repeat the old "SCH is unusably slow"
+> claim either — it was wrong in the other direction.
 >
 > 60s remains an API-enforced floor on `target.batchTimeInSec` (5 is rejected;
 > Oracle's queue-to-function doc shows a 5s example that this target refuses),

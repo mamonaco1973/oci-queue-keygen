@@ -26,15 +26,19 @@ is close enough that the distinction stops mattering for this workload.
 
 | Phase 4 mode | Configuration | End-to-end |
 |---|---|---|
-| `sch` *(default)* | `batch_size_in_num = 1` | **1–2s** |
-| `sch` | size threshold in KB | **~30s** |
+| `sch` *(default here)* | `batch_size_in_num = 1` | **0.8–2s** |
+| `sch` | `batch_size_in_num = 100` *(service default)* | **~61s** |
 | `vm` | 30s long poll | **sub-second** |
 
-**Connector Hub flushes on whichever threshold is hit first.** Set the batch
-size to one message and the batch is full the instant a message is read, so the
-batch *timer* never expires. Leave the size threshold in kilobytes — the obvious
-choice, since these messages are a few hundred bytes — and it never fills, so
-the time limit governs every flush and a request waits ~half of it.
+**Connector Hub flushes on whichever threshold is hit first, and the batch timer
+starts when the first message of a batch arrives.** Set the batch size to one
+message and the batch is full on arrival, so it flushes immediately and the
+timer never matters. Leave it at the service default of 100 messages and a
+single request never fills the batch — so it waits out the *entire* 60-second
+timer, measured at 61.54s end to end.
+
+That is a flat cost on every request, not an unlucky worst case: the window
+opens when your message lands, so each lone request restarts the full 60s.
 
 That single dropdown is the difference between a 1-second API and a 30-second
 one, and nothing in the setup flow points at it. It is the most important thing

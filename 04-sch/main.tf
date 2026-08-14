@@ -73,24 +73,27 @@ variable "nosql_table_name" {
 # ------------------------------------------------------------------------------
 # Batch tuning — the whole point of this mode
 # ------------------------------------------------------------------------------
-# MEASURED 2026-08-12, and it contradicts the obvious reading of the docs:
+# MEASURED, and it contradicts the obvious reading of the docs:
 #
-#   batch_size_in_num = 1,  batch_time_in_sec = 60  ->  1-2s end to end
-#   a KB-based size threshold, batch_time_in_sec = 60 ->  ~30s end to end
+#   batch_size_in_num = 1    (set below)        ->  0.8-2s end to end
+#   batch_size_in_num = 100  (service default)  -> 61.5s end to end
 #
-# Connector Hub flushes on whichever threshold is reached FIRST.  With a size
-# threshold of one message the batch is full the moment a message is read, so
-# the timer never expires and batch_time_in_sec is effectively inert.  The
-# residual 1-2s is the connector's own source-read interval plus the function
-# invoke — not the batch window.
+# Connector Hub flushes on whichever threshold is reached FIRST, and the batch
+# timer starts when the FIRST MESSAGE OF A BATCH ARRIVES — it is not a fixed
+# cadence.  So at the default size of 100, one request opens the window and then
+# waits out the entire 60s alone, on EVERY request.  It does not average half
+# the window: repeated runs all landed at ~61s.
 #
-# This is why the ~30s originally observed here was a configuration artifact,
-# not a service limit: a few-hundred-byte message never fills a KB-sized batch,
-# so the time limit governed every flush and requests waited ~half of it.
+# With a size threshold of one message the batch is full the moment a message is
+# read, so it flushes at once and the timer never applies.  The residual 1-2s is
+# the connector's own source-read interval plus the function invoke.
 #
 # 60 remains an API-enforced floor on batch_time_in_sec (5 is rejected outright,
 # despite Oracle's queue-to-function doc showing a 5-second example), but with
-# batch_size_in_num = 1 that floor almost never binds.
+# batch_size_in_num = 1 that floor never binds.
+#
+# Changing batch settings in the console takes about a minute to take effect —
+# the first request after an edit still runs the old configuration.
 # ------------------------------------------------------------------------------
 
 variable "batch_time_in_sec" {

@@ -1,14 +1,16 @@
 # ==============================================================================
-# OCI Queue — async message bus (SQS analog)
+# OCI Queue — async message bus
 # ==============================================================================
-# The post function publishes keygen requests here; an always-on consumer on a
-# micro-VM (04-worker) long-polls the queue and generates the keys.
+# The post function publishes keygen requests here.  What drains the queue
+# depends on PROCESSING_MODE:
 #
-# Why a VM consumer instead of a serverless trigger: OCI has no native
-# "message → invoke Function" trigger. OCI Queue cannot source Service Connector
-# Hub, and SCH (the only thing that can invoke Functions) batches on a 60s-minimum
-# window — far too slow. A consumer that long-polls the queue receives messages
-# within milliseconds, so the worker runs on a cheap always-free instance.
+#   sch (default) — Connector Hub reads this queue, invoking a worker Function.
+#   vm            — a long-polling consumer daemon on a micro-VM (04-worker).
+#
+# NOTE: an earlier version of this comment claimed Queue could not source
+# Connector Hub and that SCH was pinned to a 60s window.  Both are wrong: Queue
+# is a valid source, and Connector Hub flushes on whichever threshold is hit
+# first — with batch_size_in_num = 1 it delivers in 1-2s.  See 04-sch/main.tf.
 # ==============================================================================
 
 resource "oci_queue_queue" "keygen" {
@@ -26,6 +28,7 @@ resource "oci_queue_queue" "keygen" {
   # Default long-poll wait applied to GetMessages calls that don't specify one.
   timeout_in_seconds = 30
 
-  # Redeliver a poison message a few times, then drop it (no DLQ for the demo).
+  # After this many delivery attempts a message moves to the queue's companion
+  # dead letter queue, which OCI creates automatically — it is not discarded.
   dead_letter_queue_delivery_count = 5
 }

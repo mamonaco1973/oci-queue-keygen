@@ -3,8 +3,9 @@
 # ==============================================================================
 # OCI's official bridge from a queue to compute.  Note what it is NOT: there is
 # no "invoke on message arrival" semantic here.  The connector polls the source
-# and flushes a batch when either the size or the time threshold is reached, so
-# a request waits on average half the batch window before compute even starts.
+# and flushes a batch when either the size or the time threshold is reached.
+# The timer starts with the first message of a batch, so at the default size a
+# lone request waits the FULL window — see the measurements in main.tf.
 # ==============================================================================
 
 resource "oci_sch_service_connector" "keygen" {
