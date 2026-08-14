@@ -125,16 +125,27 @@ req_payload="$(jq -n \
 
 echo "NOTE: Sending request - key_type=${KEY_TYPE}, key_bits=${KEY_BITS}"
 
-# apply.sh calls this within seconds of creating the API Gateway, and a brand
-# new gateway hostname takes a few minutes to resolve — the first POST reliably
-# fails with curl 6 (DNS) on a cold deploy.  So retry rather than fail: the
-# endpoint is coming, it just is not in DNS yet.
+# A fresh deploy is not ready the moment Terraform returns, and it fails in two
+# different ways that both need waiting out:
+#
+#   1. Transport — a brand new gateway hostname takes minutes to resolve, so
+#      the first POST fails with curl 6 (DNS).
+#   2. Authorization — the function's Resource Principal token is minted when
+#      its container starts. If that happened before the dynamic group and
+#      policy propagated, every put_messages returns 404 (OCI reports authz
+#      failures as NotAuthorizedOrNotFound) and the API answers 500.
+#
+# Case 2 is an HTTP success as far as curl is concerned, so gating the retry on
+# curl's exit code alone gave up instantly on exactly the failure that most
+# needs a retry. The loop now retries until a request_id actually comes back.
 #
 # -sS not -s: plain -s silences curl's own error text as well as the progress
 # meter, so under `set -e` a connection failure killed this script with no
 # message and no exit code — it simply stopped after the line above.
 SUBMIT_ATTEMPTS=20
-SUBMIT_INTERVAL=15      # 20 x 15s = up to 5 minutes for DNS to catch up
+SUBMIT_INTERVAL=15      # 20 x 15s = up to 5 minutes for the deploy to settle
+
+request_id=""
 
 for ((s=1; s<=SUBMIT_ATTEMPTS; s++)); do
   set +e
@@ -144,26 +155,31 @@ for ((s=1; s<=SUBMIT_ATTEMPTS; s++)); do
   curl_rc=$?
   set -e
 
-  [[ ${curl_rc} -eq 0 ]] && break
+  if [[ ${curl_rc} -eq 0 ]]; then
+    request_id="$(echo "${response}" | jq -r '.request_id // empty' 2>/dev/null || true)"
+    [[ -n "${request_id}" ]] && break
+    # func.py echoes the OCI code alongside the message, so the wait reports
+    # what it is actually waiting on rather than a bare "no request_id".
+    reason="$(echo "${response}" | jq -r \
+      '[.error, .code] | map(select(. != null)) | join(" / ")' 2>/dev/null || true)"
+    [[ -z "${reason}" ]] && reason="${response}"
+  else
+    reason="endpoint not reachable (curl ${curl_rc})"
+  fi
 
   if [[ ${s} -eq ${SUBMIT_ATTEMPTS} ]]; then
-    echo "ERROR: POST ${api_url}/keygen failed (curl exit ${curl_rc})."
-    echo "NOTE: ${response}"
-    echo "NOTE: 6=DNS  7=connect refused  28=timeout  35/60=TLS."
+    echo "ERROR: POST ${api_url}/keygen never returned a request_id."
+    echo "NOTE: Last failure  - ${reason}"
+    echo "NOTE: Last response - ${response}"
+    echo "NOTE: curl codes 6=DNS  7=connect refused  28=timeout  35/60=TLS."
+    echo "NOTE: A persistent 404/NotAuthorizedOrNotFound means the function's"
+    echo "NOTE: token predates the policy — recycle it and retry."
     exit 1
   fi
 
-  echo "NOTE: Endpoint not reachable yet (${s}/${SUBMIT_ATTEMPTS}, curl ${curl_rc}) — waiting ${SUBMIT_INTERVAL}s..."
+  echo "NOTE: Not ready yet (${s}/${SUBMIT_ATTEMPTS}: ${reason}) — waiting ${SUBMIT_INTERVAL}s..."
   sleep "${SUBMIT_INTERVAL}"
 done
-
-request_id="$(echo "${response}" | jq -r '.request_id // empty')"
-
-if [[ -z "${request_id}" ]]; then
-  echo "ERROR: No request_id returned."
-  echo "NOTE: Response was: ${response}"
-  exit 1
-fi
 
 echo "NOTE: Submitted keygen request (${request_id})."
 echo "NOTE: Polling for result..."

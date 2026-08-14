@@ -208,8 +208,24 @@ def post_handler(ctx, data: io.BytesIO = None):
             queue_id=QUEUE_ID,
             put_messages_details=PutMessagesDetails(messages=[entry]),
         )
-    except ServiceError:
-        return _resp(ctx, 500, {"error": "Failed to enqueue request"})
+    except ServiceError as exc:
+        # Log the whole error, not just a friendly string: OCI masks authz
+        # failures as 404 NotAuthorizedOrNotFound, so the status and code are
+        # the only way to tell a policy problem from a wrong queue OCID. The
+        # code is echoed to the caller because validate.sh is the first thing
+        # to see a failure and it should not require a trip to the console.
+        print(
+            f"post: put_messages failed status={exc.status} code={exc.code} "
+            f"queue_id={QUEUE_ID!r} endpoint={QUEUE_ENDPOINT!r} "
+            f"opc_request_id={getattr(exc, 'request_id', None)} "
+            f"message={exc.message}",
+            flush=True,
+        )
+        return _resp(ctx, 500, {
+            "error": "Failed to enqueue request",
+            "code": exc.code,
+            "status": exc.status,
+        })
 
     return _resp(ctx, 202, {"request_id": corr_id, "status": "queued"})
 
@@ -251,8 +267,19 @@ def get_handler(ctx, data: io.BytesIO = None):
             key=[f"correlation_id:{corr_id}"],
             compartment_id=COMPARTMENT_ID,
         )
-    except ServiceError:
-        return _resp(ctx, 500, {"error": "Failed to retrieve result"})
+    except ServiceError as exc:
+        # Same reasoning as post_handler: a bare message here turns a policy
+        # or table-name problem into an unreadable 500.
+        print(
+            f"get: get_row failed status={exc.status} code={exc.code} "
+            f"table={TABLE_NAME!r} message={exc.message}",
+            flush=True,
+        )
+        return _resp(ctx, 500, {
+            "error": "Failed to retrieve result",
+            "code": exc.code,
+            "status": exc.status,
+        })
 
     item = _row(resp.data.value)
     if not item:
